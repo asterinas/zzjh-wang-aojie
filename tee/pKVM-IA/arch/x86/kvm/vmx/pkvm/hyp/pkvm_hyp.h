@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (C) 2022 Intel Corporation
+ */
+#ifndef __PKVM_HYP_H
+#define __PKVM_HYP_H
+
+#include <asm/kvm_pkvm.h>
+#include "pkvm_hyp_types.h"
+#include <pkvm.h>
+#include <pkvm/vmx/vmx.h>
+
+void pkvm_repriv_restore_cpu(unsigned long *vcpu_regs);
+
+#define SHADOW_VM_HANDLE_SHIFT		32
+#define SHADOW_VCPU_INDEX_MASK		((1UL << SHADOW_VM_HANDLE_SHIFT) - 1)
+#define to_shadow_vcpu_handle(vm_handle, vcpu_idx)		\
+		(((s64)(vm_handle) << SHADOW_VM_HANDLE_SHIFT) | \
+		 ((vcpu_idx) & SHADOW_VCPU_INDEX_MASK))
+
+#define pgstate_pgt_to_shadow_vm(_pgt) container_of(_pgt, struct pkvm_shadow_vm, pgstate_pgt)
+
+void pkvm_shadow_vm_link_ptdev(struct pkvm_shadow_vm *vm,
+			       struct list_head *node, bool coherency);
+void pkvm_shadow_vm_unlink_ptdev(struct pkvm_shadow_vm *vm,
+				 struct list_head *node, bool coherency);
+void pkvm_kick_vcpu(struct kvm_vcpu *vcpu);
+int pkvm_add_ptdev(int shadow_vm_handle, u16 bdf, u32 pasid);
+
+#define PKVM_REQ_TLB_FLUSH_HOST_EPT			KVM_ARCH_REQ(0)
+
+extern struct pkvm_hyp *pkvm_hyp;
+
+static inline bool shadow_vm_is_protected(struct pkvm_shadow_vm *vm)
+{
+	return vm->vm_type == KVM_X86_PKVM_PROTECTED_VM;
+}
+
+int pkvm_init_shadow_vm(struct kvm *kvm);
+void pkvm_teardown_shadow_vm(struct kvm *kvm);
+int pkvm_init_shadow_vcpu(struct kvm_vcpu *vcpu);
+void pkvm_teardown_shadow_vcpu(struct kvm_vcpu *vcpu);
+#endif

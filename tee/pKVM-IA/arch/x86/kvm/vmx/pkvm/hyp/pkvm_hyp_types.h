@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (C) 2022 Intel Corporation
+ */
+#ifndef __PKVM_HYP_TYPES_H
+#define __PKVM_HYP_TYPES_H
+
+#include <asm/pkvm_spinlock.h>
+#include "pgtable.h"
+
+/*
+ * A container for the vcpu state that hyp needs to maintain for protected VMs.
+ */
+struct shadow_vcpu_state {
+	/*
+	 * A unique id to the shadow vcpu, which is combined by
+	 * shadow_vm_handle and shadow_vcpu index in the array.
+	 * As shadow_vm_handle is in the high end and it is an
+	 * int, so define the shadow_vcpu_handle as a s64.
+	 */
+	s64 shadow_vcpu_handle;
+
+	struct pkvm_shadow_vm *vm;
+} __aligned(PAGE_SIZE);
+
+/*
+ * Holds the relevant data for running a protected vm.
+ */
+struct pkvm_shadow_vm {
+	/*
+	 * Page state page table manages the page states, and
+	 * works as IOMMU second-level page table for protected
+	 * VM with passthrough devices. For the protected VM
+	 * without passthrough devices or normal VM, it manages
+	 * the page states only.
+	 */
+	struct pkvm_pgtable pgstate_pgt;
+	/* Indicate if pgstate_pgt needs to be prepopulated */
+	bool need_prepopulation;
+	/*
+	 * Indicate the count of the shadow VM passthrough devices
+	 * which are attached to non-coherent IOMMU.
+	 */
+	unsigned long noncoherent_ptdev;
+
+	/* link the passthrough devices of a protected VM */
+	struct list_head ptdev_head;
+
+	/* The vm_type to indicate if this is a protected VM */
+	u8 vm_type;
+
+	pkvm_spinlock_t lock;
+} __aligned(PAGE_SIZE);
+
+#endif

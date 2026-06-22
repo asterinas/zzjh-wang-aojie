@@ -1,0 +1,212 @@
+/*
+ * SPDX-License-Identifier: GPL-2.0
+ * Copyright (C) 2022 Intel Corporation
+ */
+#ifndef _ASM_X86_PKVM_H
+#define _ASM_X86_PKVM_H
+
+#include <asm/kvm_para.h>
+#include <asm/io.h>
+#include <asm/coco.h>
+
+/*
+ * 15bits for PASID, DO NOT change it, based on it,
+ * the size of PASID DIR table can kept as one page
+ */
+#define PKVM_MAX_PASID_BITS	15
+#define PKVM_MAX_PASID		(1 << PKVM_MAX_PASID_BITS)
+
+struct pkvm_iommu_driver {
+	int (*prepare_driver)(void);
+	int (*init_driver)(void);
+};
+
+#define TO_PKVM_HC(f)		CONCATENATE(__pkvm__, f)
+
+enum pkvm_hc {
+	#define PKVM_HC(f)	TO_PKVM_HC(f),
+	#include <asm/pkvm_hypercalls.h>
+
+	MAX_PKVM_HYPERCALLS
+};
+
+static inline unsigned long __pkvm_hypercall(unsigned long nr, unsigned long p1,
+					     unsigned long p2, unsigned long p3,
+					     unsigned long p4, unsigned long p5)
+{
+	unsigned long ret;
+
+	asm volatile(KVM_HYPERCALL
+		     : "=a"(ret)
+		     : "a"(nr), "b"(p1), "c"(p2), "d"(p3), "S"(p4), "D"(p5)
+		     : "memory");
+	return ret;
+}
+
+#define __pkvm_hypercall_0(f)	__pkvm_hypercall(f, 0, 0, 0, 0, 0)
+
+#define __pkvm_hypercall_1(f, a1)							\
+	({										\
+		__pkvm_hypercall(f,							\
+			(unsigned long)(a1), 0, 0, 0, 0);				\
+	})
+
+#define __pkvm_hypercall_2(f, a1, a2)							\
+	({										\
+		__pkvm_hypercall(f,							\
+			(unsigned long)(a1), (unsigned long)(a2), 0, 0, 0);		\
+	})
+
+#define __pkvm_hypercall_3(f, a1, a2, a3)						\
+	({										\
+		__pkvm_hypercall(f,							\
+			(unsigned long)(a1), (unsigned long)(a2),			\
+			(unsigned long)(a3), 0, 0);					\
+	})
+
+#define __pkvm_hypercall_4(f, a1, a2, a3, a4)						\
+	({										\
+		__pkvm_hypercall(f,							\
+			(unsigned long)(a1), (unsigned long)(a2),			\
+			(unsigned long)(a3), (unsigned long)(a4), 0);			\
+	})
+
+#define __pkvm_hypercall_5(f, a1, a2, a3, a4, a5)					\
+	({										\
+		__pkvm_hypercall(f,							\
+			(unsigned long)(a1), (unsigned long)(a2),			\
+			(unsigned long)(a3), (unsigned long)(a4),			\
+			(unsigned long)(a5));						\
+	})
+
+#define pkvm_hypercall(f, ...)								\
+	({										\
+		CONCATENATE(__pkvm_hypercall_,						\
+			    COUNT_ARGS(__VA_ARGS__))(TO_PKVM_HC(f), ##__VA_ARGS__);	\
+	})
+
+#ifdef CONFIG_PKVM_INTEL
+
+#ifndef __PKVM_HYP__
+
+extern bool __read_mostly enable_pkvm;	/* kernel command-line flag */
+
+extern struct static_key_false pkvm_enabled_key;
+
+static inline bool pkvm_enabled(void)
+{
+	return static_branch_likely(&pkvm_enabled_key);
+}
+
+int pkvm_iommu_register_driver(const struct pkvm_iommu_driver *kern_ops);
+
+static inline u64 pkvm_readq(void __iomem *reg, unsigned long reg_phys,
+			     unsigned long offset)
+{
+	if (pkvm_enabled())
+		return (u64)pkvm_hypercall(iommu_mmio_access, true,
+					   sizeof(u64), reg_phys + offset);
+	else
+		return readq(reg + offset);
+}
+
+static inline u32 pkvm_readl(void __iomem *reg, unsigned long reg_phys,
+			     unsigned long offset)
+{
+	if (pkvm_enabled())
+		return (u32)pkvm_hypercall(iommu_mmio_access, true,
+					   sizeof(u32), reg_phys + offset);
+	else
+		return readl(reg + offset);
+}
+
+static inline void pkvm_writeq(void __iomem *reg, unsigned long reg_phys,
+			       unsigned long offset, u64 val)
+{
+	if (pkvm_enabled())
+		pkvm_hypercall(iommu_mmio_access, false, sizeof(u64),
+			       reg_phys + offset, val);
+	else
+		writeq(val, reg + offset);
+}
+
+static inline void pkvm_writel(void __iomem *reg, unsigned long reg_phys,
+			       unsigned long offset, u32 val)
+{
+	if (pkvm_enabled())
+		pkvm_hypercall(iommu_mmio_access, false, sizeof(u32),
+			       reg_phys + offset, (u64)val);
+	else
+		writel(val, reg + offset);
+}
+
+#else /* __PKVM_HYP__ */
+
+/* we are in pkvm hypervisor, pkvm is enabled by definition */
+#define enable_pkvm true
+
+#endif /* __PKVM_HYP__ */
+
+static inline void pkvm_update_iommu_virtual_caps(u64 *cap, u64 *ecap)
+{
+#ifndef __PKVM_HYP__
+	if (!enable_pkvm)
+		return;
+#endif
+
+	if (cap)
+		/*
+		 * Set caching mode as linux OS will runs in a VM
+		 * with controlling a virtual IOMMU device emulated
+		 * by pkvm.
+		 */
+		*cap |= 1 << 7;
+
+	if (ecap) {
+		u64 tmp;
+
+		/*
+		 * Some IOMMU capabilities cannot be directly used by the linux
+		 * IOMMU driver after the linux is deprivileged, which is because after
+		 * deprivileging, pkvm IOMMU driver will control the physical IOMMU and
+		 * it is designed to use physical IOMMU in two ways for better performance
+		 * and simpler implementation:
+		 * 1. using nested translation with the first-level from the deprivileged
+		 * linux IOMMU driver and EPT as second-level.
+		 * 2. using second-level only translation with EPT.
+		 * The linux IOMMU driver then uses an virtual IOMMU device emulated by
+		 * pkvm IOMMU driver.
+		 *
+		 * Way#1 and way#2 can only support the linux IOMMU driver works in
+		 * first-level translation mode or HW pass-through mode. To guarantee
+		 * this, let linux IOMMU driver to pick up the supported capabilities
+		 * when running at the bare metal if pkvm is enabled, to make it as a
+		 * pkvm-awared IOMMU kernel driver.
+		 *
+		 * So disable SLTS and Nest.
+		 */
+		*ecap &= ~((1UL << 46) | (1UL << 26));
+
+		/* limit PASID to reduce the memory consumptions */
+		tmp = min_t(u64, (PKVM_MAX_PASID_BITS - 1),
+			    (*ecap & GENMASK_ULL(39, 35)) >> 35);
+		*ecap = (*ecap & ~GENMASK_ULL(39, 35)) | (tmp << 35);
+	}
+}
+#else /* CONFIG_PKVM_INTEL */
+
+#define enable_pkvm false
+
+static inline bool pkvm_enabled(void)
+{
+	return false;
+}
+
+static inline int pkvm_iommu_register_driver(const struct pkvm_iommu_driver *kern_ops)
+{
+	return -EPERM;
+}
+
+#endif /* CONFIG_PKVM_INTEL */
+
+#endif

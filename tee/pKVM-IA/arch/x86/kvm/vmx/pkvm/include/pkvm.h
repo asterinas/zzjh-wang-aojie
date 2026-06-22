@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (C) 2022 Intel Corporation
+ */
+
+#ifndef _PKVM_H_
+#define _PKVM_H_
+
+#include <asm/pkvm_image.h>
+#include <vmx/vmx.h>
+
+#define PKVM_STACK_SIZE 	SZ_16K
+/* Size of reserved space for private parameter in pkvm stack */
+#define PKVM_STACK_TOP_RESV	16
+#define PKVM_MAX_IOMMU_NUM	32
+#define PKVM_MAX_PASID_PDEV_NUM	32
+#define PKVM_MAX_PDEV_NUM	512
+#define PKVM_MAX_DEVS_IN_SATC	16
+
+struct pkvm_pgtable_cap {
+	int level;
+	int allowed_pgsz;
+	u64 table_prot;
+};
+
+struct idt_page {
+	gate_desc idt[IDT_ENTRIES];
+} __aligned(PAGE_SIZE);
+
+struct pkvm_pcpu {
+	u8 stack[PKVM_STACK_SIZE] __aligned(16);
+	unsigned long cr3;
+	struct gdt_page gdt_page;
+	struct idt_page idt_page;
+	struct tss_struct tss;
+	void *lapic;
+	struct kvm_cpuid_entry2 cpuid_def[KVM_MAX_CPUID_ENTRIES];
+};
+
+struct pkvm_host_vcpu {
+	struct vcpu_vmx vmx;
+	struct pkvm_pcpu *pcpu;
+	struct vmcs *vmxarea;
+};
+
+struct pkvm_host_vm {
+	struct pkvm_host_vcpu *host_vcpus[CONFIG_NR_CPUS];
+	struct pkvm_pgtable *ept;
+	struct pkvm_pgtable *ept_notlbflush;
+};
+
+struct pkvm_iommu_info {
+	u64 reg_phys;
+	u64 reg_size;
+};
+
+struct pkvm_hyp {
+	int num_cpus;
+
+	struct vmx_capability vmx_cap;
+	struct vmcs_config vmcs_config;
+
+	struct pkvm_pgtable_cap mmu_cap;
+	struct pkvm_pgtable_cap ept_cap;
+
+	struct pkvm_pgtable *mmu;
+
+	struct pkvm_pcpu *pcpus[CONFIG_NR_CPUS];
+
+	struct pkvm_host_vm host_vm;
+
+	struct pkvm_iommu_info iommu_infos[PKVM_MAX_IOMMU_NUM];
+
+	/*
+	 * IOMMU works in nested translation mode with sharing
+	 * the EPT as second-level page table. So the page table
+	 * level and large page size should be supported by both
+	 * EPT and IOMMU.
+	 */
+	int ept_iommu_pgt_level;
+	int ept_iommu_pgsz_mask;
+
+	bool iommu_coherent;
+
+	/* Store BDF of all devices in the SATC ACPI table */
+	u16 satc_dev_bdf[PKVM_MAX_DEVS_IN_SATC];
+	int satc_dev_cnt;
+};
+
+static inline struct pkvm_host_vcpu *vmx_to_pkvm_hvcpu(struct vcpu_vmx *vmx)
+{
+	return container_of(vmx, struct pkvm_host_vcpu, vmx);
+}
+
+static inline struct pkvm_host_vcpu *to_pkvm_hvcpu(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+
+	return vmx_to_pkvm_hvcpu(vmx);
+}
+
+static inline unsigned long get_host_stack_top(struct pkvm_pcpu *pcpu)
+{
+	return (unsigned long) &pcpu->stack[sizeof(pcpu->stack)];
+}
+
+struct pkvm_section {
+	unsigned long type;
+#define PKVM_RESERVED_MEMORY		0UL
+#define PKVM_CODE_DATA_SECTIONS		1UL
+#define KERNEL_DATA_SECTIONS		2UL
+	unsigned long addr;
+	unsigned long size;
+	u64 prot;
+};
+
+#define PKVM_REQUIRES_L1D_FLUSH_PAGES \
+	(boot_cpu_has_bug(X86_BUG_L1TF) && !boot_cpu_has(X86_FEATURE_FLUSH_L1D))
+#define PKVM_PAGES (ALIGN(sizeof(struct pkvm_hyp), PAGE_SIZE) >> PAGE_SHIFT)
+#define PKVM_GLOBAL_PAGES (PKVM_PAGES + (PKVM_REQUIRES_L1D_FLUSH_PAGES ? 1 << L1D_CACHE_ORDER : 0))
+#define PKVM_PCPU_PAGES (ALIGN(sizeof(struct pkvm_pcpu), PAGE_SIZE) >> PAGE_SHIFT)
+#define PKVM_HOST_VCPU_PAGES (ALIGN(sizeof(struct pkvm_host_vcpu), PAGE_SIZE) >> PAGE_SHIFT)
+#define PKVM_HOST_VCPU_VMCS_PAGES 3 /*vmxarea+vmcs+msr_bitmap*/
+
+extern unsigned long pkvm_sym(__page_base_offset);
+extern unsigned long pkvm_sym(__symbol_base_offset);
+extern struct pkvm_hyp *pkvm_sym(pkvm_hyp);
+extern unsigned long pkvm_sym(__x86_clflush_size);
+extern struct cpuinfo_x86 pkvm_sym(boot_cpu_data);
+extern unsigned int pkvm_sym(tsc_khz);
+extern struct cpumask pkvm_sym(__cpu_possible_mask);
+extern unsigned int pkvm_sym(nr_cpu_ids);
+extern u64 pkvm_sym(x86_pred_cmd);
+extern unsigned long pkvm_sym(l1d_flush_phys);
+DECLARE_STATIC_KEY_FALSE(pkvm_sym(mmio_stale_data_clear));
+DECLARE_STATIC_KEY_FALSE(pkvm_sym(vmx_l1d_should_flush));
+DECLARE_STATIC_KEY_FALSE(pkvm_sym(vmx_l1d_flush_cond));
+
+extern bool pkvm_sym(pvmfw_present);
+extern phys_addr_t pkvm_sym(pvmfw_base);
+extern phys_addr_t pkvm_sym(pvmfw_size);
+
+extern struct fpu_state_config pkvm_sym(fpu_kernel_cfg);
+extern struct fpu_state_config pkvm_sym(fpu_user_cfg);
+#ifdef CONFIG_X86_64
+DECLARE_STATIC_KEY_FALSE(pkvm_sym(__fpu_state_size_dynamic));
+#endif
+
+PKVM_DECLARE(void, __pkvm_vmexit_entry, (void));
+PKVM_DECLARE(void, pkvm_init_host_state_area, (struct pkvm_pcpu *pcpu, int cpu));
+
+PKVM_DECLARE(void *, pkvm_early_alloc_contig, (unsigned int nr_pages));
+PKVM_DECLARE(void *, pkvm_early_alloc_page, (struct pkvm_memcache *mc));
+PKVM_DECLARE(void, pkvm_early_alloc_init, (void *virt, unsigned long size));
+
+PKVM_DECLARE(void, init_msr_emulation, (struct vcpu_vmx *vmx));
+
+#define GEN(x, ...) PKVM_DECLARE(void, handle_exception_##x, (void));
+#include "GEN-for-each-exc.h"
+#undef GEN
+
+#ifndef CONFIG_PKVM_INTEL_DEBUG
+PKVM_DECLARE(unsigned int, pkvm_per_cpu_nr_pages, (void));
+#define PKVM_PERCPU_PAGES (PKVM_PCPU_PAGES + PKVM_HOST_VCPU_PAGES + \
+			   PKVM_HOST_VCPU_VMCS_PAGES + pkvm_sym(pkvm_per_cpu_nr_pages)())
+#else
+#define PKVM_PERCPU_PAGES (PKVM_PCPU_PAGES + PKVM_HOST_VCPU_PAGES + \
+			   PKVM_HOST_VCPU_VMCS_PAGES)
+#endif
+PKVM_DECLARE(int, setup_pkvm_per_cpu, (int cpu, unsigned long base));
+PKVM_DECLARE(void, set_x86_spec_ctrl, (u64 spec_ctrl));
+
+#endif

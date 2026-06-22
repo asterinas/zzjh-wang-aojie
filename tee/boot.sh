@@ -1,0 +1,17 @@
+/usr/local/qemu/bin/qemu-system-x86_64 \
+		-drive file=/home/wangaojie/tee/workdir/ubuntu.qcow2,format=qcow2 \
+		-machine q35,accel=kvm,kernel-irqchip=split \
+		-cpu host,kvm-pv-unhalt=off,kvm-pv-ipi=off,kvm-pv-sched-yield=off \
+		-device intel-iommu,aw-bits=48 \
+		-m 16G -smp 8 \
+		-name debug-threads=on \
+		-vga none \
+		-display none \
+		-device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56 \
+		-netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:1235-:1234 \
+		-serial file:/home/wangaojie/tee/workdir/serial.log \
+		-monitor unix:/home/wangaojie/tee/workdir/qemu-monitor-socket,server,nowait \
+		-daemonize \
+		-kernel /home/wangaojie/tee/workdir/bzImage \
+		-append "root=/dev/sda2 console=ttyS0,115200n8 earlyprintk=ttyS0,115200n8 kvm-intel.pkvm=1 nokaslr systemd.mask=NetworkManager-wait-online.service systemd.mask=systemd-networkd-wait-online.service" \
+		-gdb tcp:127.0.0.1:1234

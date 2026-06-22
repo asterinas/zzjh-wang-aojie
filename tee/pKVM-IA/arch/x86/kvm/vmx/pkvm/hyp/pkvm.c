@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (C) 2022 Intel Corporation
+ */
+
+#include <linux/hashtable.h>
+#include <pkvm.h>
+
+#include "pkvm_hyp.h"
+#include "ept.h"
+#include "mem_protect.h"
+#include "lapic.h"
+#include "ptdev.h"
+#include <pkvm/pkvm.h>
+#include <pkvm/vmx/vmx.h>
+
+struct pkvm_hyp *pkvm_hyp;
+
+#define to_shadow_vm_handle(vcpu_handle)	((s64)(vcpu_handle) >> SHADOW_VM_HANDLE_SHIFT)
+#define to_shadow_vcpu_idx(vcpu_handle)		((s64)(vcpu_handle) & SHADOW_VCPU_INDEX_MASK)
+
+void pkvm_shadow_vm_link_ptdev(struct pkvm_shadow_vm *vm,
+			       struct list_head *node, bool coherency)
+{
+	pkvm_spin_lock(&vm->lock);
+	list_add_tail(node, &vm->ptdev_head);
+	vm->noncoherent_ptdev += !coherency;
+	vm->need_prepopulation = true;
+	pkvm_shadow_sl_iommu_pgt_update_coherency(&vm->pgstate_pgt,
+						  !vm->noncoherent_ptdev);
+	pkvm_spin_unlock(&vm->lock);
+}
+
+void pkvm_shadow_vm_unlink_ptdev(struct pkvm_shadow_vm *vm,
+				 struct list_head *node, bool coherency)
+{
+	pkvm_spin_lock(&vm->lock);
+	list_del(node);
+	vm->noncoherent_ptdev -= !coherency;
+	pkvm_shadow_sl_iommu_pgt_update_coherency(&vm->pgstate_pgt,
+						  !vm->noncoherent_ptdev);
+	pkvm_spin_unlock(&vm->lock);
+}
+
+void pkvm_kick_vcpu(struct kvm_vcpu *vcpu)
+{
+	if (kvm_vcpu_exiting_guest_mode(vcpu) != IN_GUEST_MODE)
+		return;
+
+	/*
+	 * Vcpu might be already put at this moment thus eventually no init will
+	 * be send. But it should be fine as vcpu already exited guest mode.
+	 */
+	pkvm_lapic_send_init(READ_ONCE(vcpu->cpu));
+}
+
+int pkvm_add_ptdev(int shadow_vm_handle, u16 bdf, u32 pasid)
+{
+	struct pkvm_vm *pkvm_vm = get_pkvm_vm(shadow_vm_handle);
+	struct pkvm_shadow_vm *vm;
+	int ret = 0;
+
+	if (!pkvm_vm)
+		return -EINVAL;
+
+	vm = kvm_to_shadow(to_kvm(pkvm_vm));
+
+	if (shadow_vm_is_protected(vm))
+		ret = pkvm_attach_ptdev(bdf, pasid, vm);
+
+	put_pkvm_vm(pkvm_vm);
+
+	return ret;
+}
+
+int pkvm_init_shadow_vm(struct kvm *kvm)
+{
+	struct pkvm_shadow_vm *vm = kvm_to_shadow(kvm);
+
+	pkvm_spin_lock_init(&vm->lock);
+	INIT_LIST_HEAD(&vm->ptdev_head);
+	vm->vm_type = kvm->arch.vm_type;
+
+	return pkvm_pgstate_pgt_init(vm);
+}
+
+void pkvm_teardown_shadow_vm(struct kvm *kvm)
+{
+	struct pkvm_shadow_vm *vm = kvm_to_shadow(kvm);
+	struct pkvm_ptdev *ptdev, *tmp;
+
+	pkvm_pgstate_pgt_deinit(vm);
+
+	list_for_each_entry_safe(ptdev, tmp, &vm->ptdev_head, vm_node)
+		pkvm_detach_ptdev(ptdev, vm);
+}
+
+int pkvm_init_shadow_vcpu(struct kvm_vcpu *vcpu)
+{
+	struct shadow_vcpu_state *shadow_vcpu = kvm_vcpu_to_shadow(vcpu);
+	int vm_handle = vcpu->kvm->arch.pkvm.pkvm_vm_handle;
+	struct pkvm_vcpu *pkvm_vcpu = to_pkvm_vcpu(vcpu);
+
+	shadow_vcpu->shadow_vcpu_handle =
+		to_shadow_vcpu_handle(vm_handle, pkvm_vcpu->vcpu_idx);
+	shadow_vcpu->vm = kvm_to_shadow(vcpu->kvm);
+
+	return 0;
+}
+
+void pkvm_teardown_shadow_vcpu(struct kvm_vcpu *vcpu)
+{
+	struct shadow_vcpu_state *shadow_vcpu = kvm_vcpu_to_shadow(vcpu);
+
+	shadow_vcpu->vm = NULL;
+	shadow_vcpu->shadow_vcpu_handle = 0;
+}

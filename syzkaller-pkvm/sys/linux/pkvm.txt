@@ -1,0 +1,137 @@
+# Description of pkvm hypercall arguments via syscall pkvm_fuzz.
+
+meta arches["amd64"]
+
+include <linux/types.h>
+include <linux/kvm_host.h>
+
+ioctl$KVM_CREATE_VM_PKVM(fd fd_kvm, cmd const[KVM_CREATE_VM], type const[KVM_X86_PKVM_PROTECTED_VM]) fd_kvmvm
+
+msr_data {
+	host_initiated	int8[0:1]
+	index           int32
+	data            int64
+}
+
+desc_ptr {
+	size		int16
+	address		int64
+} [packed]
+
+pkvm_fuzz_exit_info {
+	reason		int32
+	intr_info	int32
+	error_code	int32
+	pad		    int32
+	info1		int64
+	info2		int64
+}
+
+type bool int64[0:1]
+type seg_id int64[0:7]
+type gva_t int64
+type hpa_t int64
+# resource vm_handle[int32]: -1
+
+pkvm_fuzz$pkvm_check_processor_compat(fn const[0], a0 const[0], a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_enable_virtualization_cpu(fn const[1], a0 const[0], a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_disable_virtualization_cpu(fn const[2], a0 const[0], a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_emergency_disable_virtualization_cpu(fn const[3], a0 const[0], a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+# TODO: index
+pkvm_fuzz$pkvm_has_emulated_msr(fn const[4], vm fd_kvmvm, index int64[0:0xffffffff], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_vm_init(fn const[5], vm fd_kvmvm, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_vm_destroy(fn const[6], vm fd_kvmvm, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+
+pkvm_fuzz$pkvm_vcpu_create(fn const[7], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_vcpu_free(fn const[8], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_vcpu_reset(fn const[9], vcpu fd_kvmcpu, init_event bool, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_prepare_switch_to_guest(fn const[10], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_vcpu_load(fn const[11], vcpu fd_kvmcpu, cpu int64[0:0xffffffff], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_vcpu_put(fn const[12], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+
+pkvm_fuzz$pkvm_update_exception_bitmap(fn const[13], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_get_feature_msr(fn const[14], msr int64[0:0xffffffff], data ptr[out, int64], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_get_msr(fn const[15], vcpu fd_kvmcpu, msr_info ptr[inout, msr_data], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_set_msr(fn const[16], vcpu fd_kvmcpu, msr_info ptr[in, msr_data], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_get_segment_base(fn const[17], vcpu fd_kvmcpu, seg seg_id, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_get_segment(fn const[18], vcpu fd_kvmcpu, var ptr[out, kvm_segment], seg seg_id, a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_set_segment(fn const[19], vcpu fd_kvmcpu, var ptr[in, kvm_segment], seg seg_id, a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_get_cpl(fn const[20], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_get_cs_db_l_bits(fn const[21], vcpu fd_kvmcpu, db ptr[out, int32], l ptr[out, int32], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_is_valid_cr0(fn const[22], vcpu fd_kvmcpu, cr0 int64, a2 const[0], a3 const[0], a4 const[0])
+# constraint of cr0 in x86.c:kvm_is_valid_cr0
+pkvm_fuzz$pkvm_set_cr0(fn const[23], vcpu fd_kvmcpu, cr0 int64[0:0xffffffff], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_post_set_cr3(fn const[24], vcpu fd_kvmcpu, cr3 int64, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_is_valid_cr4(fn const[25], vcpu fd_kvmcpu, cr4 int64, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_set_cr4(fn const[26], vcpu fd_kvmcpu, cr4 int64, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_set_efer(fn const[27], vcpu fd_kvmcpu, efer int64, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_get_idt(fn const[28], vcpu fd_kvmcpu, desc ptr[out, desc_ptr], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_set_idt(fn const[29], vcpu fd_kvmcpu, desc ptr[in, desc_ptr], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_get_gdt(fn const[30], vcpu fd_kvmcpu, desc ptr[out, desc_ptr], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_set_gdt(fn const[31], vcpu fd_kvmcpu, desc ptr[in, desc_ptr], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_set_dr7(fn const[32], vcpu fd_kvmcpu, dr7 int64, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_sync_dirty_debug_regs(fn const[33], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_cache_reg(fn const[34], vcpu fd_kvmcpu, reg flags[kvm_cache_reg], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_get_rflags(fn const[35], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_set_rflags(fn const[36], vcpu fd_kvmcpu, rflags int64, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_get_if_flag(fn const[37], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+
+pkvm_fuzz$pkvm_flush_tlb_all(fn const[38], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_flush_tlb_current(fn const[39], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_flush_tlb_gva(fn const[40], vcpu fd_kvmcpu, gva gva_t, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_flush_tlb_guest(fn const[41], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+
+pkvm_fuzz$pkvm_vcpu_pre_run(fn const[42], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+# run_flags is a flag?
+pkvm_fuzz$pkvm_vcpu_run(fn const[43], vcpu fd_kvmcpu, run_flags int64, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_handle_exit(fn const[44], vcpu fd_kvmcpu, exit_fastpath int64, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_skip_emulated_instruction(fn const[45], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_update_emulated_instruction(fn const[46], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_set_interrupt_shadow(fn const[47], vcpu fd_kvmcpu, mask int64[0:0xffffffff], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_get_interrupt_shadow(fn const[48], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_inject_irq(fn const[49], vcpu fd_kvmcpu, reinjected bool, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_inject_nmi(fn const[50], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_inject_exception(fn const[51], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_cancel_injection(fn const[52], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_interrupt_allowed(fn const[53], vcpu fd_kvmcpu, for_injection bool, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_nmi_allowed(fn const[54], vcpu fd_kvmcpu, for_injection bool, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_get_nmi_mask(fn const[55], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_set_nmi_mask(fn const[56], vcpu fd_kvmcpu, masked bool, a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_enable_nmi_window(fn const[57], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_enable_irq_window(fn const[58], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_update_cr8_intercept(fn const[59], vcpu fd_kvmcpu, tpr int64[0:0xffffffff], irr int64[0:0xffffffff], a3 const[0], a4 const[0])
+
+pkvm_fuzz$pkvm_set_virtual_apic_mode(fn const[60], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_set_apic_access_page_addr(fn const[61], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_refresh_apicv_exec_ctrl(fn const[62], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_load_eoi_exitmap(fn const[63], vcpu fd_kvmcpu, exitmap ptr[in, array[int64, 4]], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_hwapic_irr_update(fn const[64], vcpu fd_kvmcpu, max_irr int64[0:0xffffffff], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_hwapic_isr_update(fn const[65], vcpu fd_kvmcpu, max_isr int64[0:0xffffffff], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_sync_pir_to_irr(fn const[66], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+
+pkvm_fuzz$pkvm_get_exit_info(fn const[67], vcpu fd_kvmcpu, infos ptr[out, pkvm_fuzz_exit_info], a2 const[0], a3 const[0], a4 const[0])
+
+pkvm_fuzz$pkvm_vcpu_after_set_cpuid(fn const[68], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+
+pkvm_fuzz$pkvm_has_vmx_wbinvd_exit(fn const[69], a0 const[0], a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+
+pkvm_fuzz$pkvm_get_l2_tsc_offset(fn const[70], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_get_l2_tsc_multiplier(fn const[71], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_write_tsc_offset(fn const[72], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_write_tsc_multiplier(fn const[73], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+
+pkvm_fuzz$pkvm_load_mmu_pgd(fn const[74], vcpu fd_kvmcpu, root_hpa hpa_t, root_level flags[pt_root_level], a3 const[0], a4 const[0])
+
+# TODO: fn = 75 needs to design helper function and Syzlang description
+
+pkvm_fuzz$pkvm_setup_mce(fn const[76], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+
+# TODO: fn = 77 needs to design helper function and Syzlang description
+pkvm_fuzz$pkvm_apic_init_signal_blocked(fn const[78], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_migrate_timers(fn const[79], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_msr_filter_changed(fn const[80], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_complete_emulated_msr(fn const[81], vcpu fd_kvmcpu, err int64[0:0xffffffff], a2 const[0], a3 const[0], a4 const[0])
+pkvm_fuzz$pkvm_update_cpuid_runtime(fn const[82], vcpu fd_kvmcpu, a1 const[0], a2 const[0], a3 const[0], a4 const[0])
+
+kvm_cache_reg = VCPU_REGS_RSP, VCPU_REGS_RIP, VCPU_EXREG_PDPTR, VCPU_EXREG_CR0, VCPU_EXREG_CR3, VCPU_EXREG_CR4
+pt_root_level = PT32_ROOT_LEVEL, PT32E_ROOT_LEVEL, PT64_ROOT_4LEVEL, PT64_ROOT_5LEVEL

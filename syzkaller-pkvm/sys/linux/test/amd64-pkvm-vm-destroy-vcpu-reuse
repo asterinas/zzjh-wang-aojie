@@ -1,0 +1,21 @@
+#
+# requires: arch=amd64 manual
+# target: reuse live vcpu fd after pkvm_fuzz$vm_destroy
+#
+r0 = openat$kvm(0xffffffffffffff9c, &AUTO='/dev/kvm\x00', 0x0, 0x0)
+r1 = ioctl$KVM_CREATE_VM_PKVM(r0, AUTO, 0x1c)
+r2 = syz_kvm_setup_syzos_vm$x86(r1, &(0x7f0000c00000/0x400000)=nil)
+r3 = syz_kvm_add_vcpu$x86(r2, &(0x7f0000000000)={0x0, &AUTO=[], AUTO})
+r4 = ioctl$KVM_GET_VCPU_MMAP_SIZE(r0, AUTO)
+r5 = mmap$KVM_VCPU(&(0x7f0000009000/0x1000)=nil, r4, 0x3, 0x1, r3, 0x0)
+ioctl$KVM_RUN(r3, AUTO, 0x0)
+pkvm_fuzz$pkvm_vm_init(AUTO, r1, 0x0, 0x0, 0x0, 0x0)
+pkvm_fuzz$pkvm_vcpu_create(AUTO, r3, 0x0, 0x0, 0x0, 0x0)
+pkvm_fuzz$pkvm_vm_destroy(AUTO, r1, 0x0, 0x0, 0x0, 0x0)
+pkvm_fuzz$pkvm_set_cr0(AUTO, r3, 0xffffffff, 0x0, 0x0, 0x0)
+pkvm_fuzz$pkvm_set_cr4(AUTO, r3, 0xffffffffffffffff, 0x0, 0x0, 0x0)
+pkvm_fuzz$pkvm_set_efer(AUTO, r3, 0xffffffffffffffff, 0x0, 0x0, 0x0)
+pkvm_fuzz$pkvm_set_interrupt_shadow(AUTO, r3, 0xffffffff, 0x0, 0x0, 0x0)
+pkvm_fuzz$pkvm_update_exception_bitmap(AUTO, r3, 0x0, 0x0, 0x0, 0x0)
+pkvm_fuzz$pkvm_vcpu_run(AUTO, r3, 0x1, 0x0, 0x0, 0x0)
+pkvm_fuzz$pkvm_load_mmu_pgd(AUTO, r3, 0xfffffffffffff000, 0x5, 0x0, 0x0)

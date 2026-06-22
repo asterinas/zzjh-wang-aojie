@@ -1,0 +1,3553 @@
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/moduleparam.h>
+#include <asm/perf_event.h>
+#include <asm/kvm_pkvm.h>
+#include <asm/fred.h>
+#include <asm/pkvm.h>
+#include "pkvm.h"
+#include "pkvm_constants.h"
+
+#include "x86_ops.h"
+#include "vmx.h"
+#include "nested.h"
+#include "pmu.h"
+#include "posted_intr.h"
+#include <trace/events/ipi.h>
+#include "trace.h"
+
+// pkvm_fuzz syscall
+#include <linux/syscalls.h>
+#include <linux/file.h>
+#include <linux/uaccess.h>
+#include <linux/slab.h>
+
+static DEFINE_PER_CPU(union pkvm_pv_param, pv_param);
+
+#define get_this_pv_param(f)		(&per_cpu(pv_param, get_cpu()).f)
+#define put_this_pv_param(ptr)		\
+({					\
+	memset(ptr, 0, sizeof(*ptr));	\
+	ptr = NULL;			\
+	put_cpu();			\
+})
+
+static void free_pml_buffer(struct vcpu_vmx *vmx)
+{
+	if (vmx->pml_pg) {
+		free_page((unsigned long)vmx->pml_pg);
+		vmx->pml_pg = NULL;
+	}
+}
+
+static void free_ve_info(struct vcpu_vmx *vmx)
+{
+	if (vmx->ve_info) {
+		free_page((unsigned long)vmx->ve_info);
+		vmx->ve_info = NULL;
+	}
+}
+
+static void pkvm_free_loaded_vmcs(struct loaded_vmcs *loaded_vmcs)
+{
+	if (!loaded_vmcs->vmcs)
+		return;
+	free_vmcs(loaded_vmcs->vmcs);
+	loaded_vmcs->vmcs = NULL;
+	if (loaded_vmcs->msr_bitmap)
+		free_page((unsigned long)loaded_vmcs->msr_bitmap);
+	WARN_ON(loaded_vmcs->shadow_vmcs != NULL);
+}
+
+static int pkvm_alloc_loaded_vmcs(struct loaded_vmcs *loaded_vmcs)
+{
+	loaded_vmcs->vmcs = alloc_vmcs(false);
+	if (!loaded_vmcs->vmcs)
+		return -ENOMEM;
+
+	loaded_vmcs->shadow_vmcs = NULL;
+	loaded_vmcs->hv_timer_soft_disabled = false;
+	loaded_vmcs->cpu = -1;
+
+	if (cpu_has_vmx_msr_bitmap()) {
+		loaded_vmcs->msr_bitmap = (unsigned long *)
+				__get_free_page(GFP_KERNEL_ACCOUNT);
+		if (!loaded_vmcs->msr_bitmap)
+			goto out_vmcs;
+	}
+
+	memset(&loaded_vmcs->host_state, 0, sizeof(struct vmcs_host_state));
+	memset(&loaded_vmcs->controls_shadow, 0,
+		sizeof(struct vmcs_controls_shadow));
+
+	return 0;
+
+out_vmcs:
+	pkvm_free_loaded_vmcs(loaded_vmcs);
+	return -ENOMEM;
+}
+
+static void __pkvm_vcpu_unload(void *arg)
+{
+	struct kvm_vcpu *vcpu = arg;
+	struct vcpu_vmx *vmx;
+
+	pkvm_hypercall(vcpu_put, vcpu);
+
+	vmx = to_vmx(vcpu);
+	vmx->loaded_vmcs->cpu = -1;
+}
+
+static void pkvm_vcpu_unload(struct kvm_vcpu *vcpu)
+{
+	int cpu = to_vmx(vcpu)->loaded_vmcs->cpu;
+
+	if (cpu != -1)
+		smp_call_function_single(cpu, __pkvm_vcpu_unload, vcpu, 1);
+}
+
+static bool pkvm_segment_cache_test(struct vcpu_vmx *vmx, int seg, int field)
+{
+	u32 mask = 1 << (seg * SEG_FIELD_NR + field);
+
+	if (!kvm_register_is_available(&vmx->vcpu, VCPU_EXREG_SEGMENTS)) {
+		kvm_register_mark_available(&vmx->vcpu, VCPU_EXREG_SEGMENTS);
+		vmx->segment_cache.bitmask = 0;
+	}
+
+	return vmx->segment_cache.bitmask & mask;
+}
+
+static void pkvm_segment_cache_set(struct vcpu_vmx *vmx, int seg, int field)
+{
+	u32 mask = 1 << (seg * SEG_FIELD_NR + field);
+
+	if (!kvm_register_is_available(&vmx->vcpu, VCPU_EXREG_SEGMENTS)) {
+		kvm_register_mark_available(&vmx->vcpu, VCPU_EXREG_SEGMENTS);
+		vmx->segment_cache.bitmask = 0;
+	}
+
+	vmx->segment_cache.bitmask |= mask;
+}
+
+static void pkvm_cache_segment(struct vcpu_vmx *vmx, struct kvm_segment *var, int seg)
+{
+	struct kvm_save_segment *save = &vmx->segment_cache.seg[seg];
+
+	save->selector = var->selector;
+	pkvm_segment_cache_set(vmx, seg, SEG_FIELD_SEL);
+
+	save->base = var->base;
+	pkvm_segment_cache_set(vmx, seg, SEG_FIELD_BASE);
+
+	save->limit = var->limit;
+	pkvm_segment_cache_set(vmx, seg, SEG_FIELD_LIMIT);
+
+	save->ar = (var->unusable << 16) |
+		      (var->g << 15)	 |
+		      (var->db << 14)	 |
+		      (var->l << 13)	 |
+		      (var->avl << 12)	 |
+		      (var->present << 7)	 |
+		      (var->dpl << 5)	 |
+		      (var->s << 4)	 |
+		      var->type;
+	pkvm_segment_cache_set(vmx, seg, SEG_FIELD_AR);
+}
+
+static fastpath_t pkvm_exit_handlers_fastpath(struct kvm_vcpu *vcpu)
+{
+	switch (to_vmx(vcpu)->exit_reason.basic) {
+	case EXIT_REASON_MSR_WRITE:
+		return handle_fastpath_set_msr_irqoff(vcpu);
+	default:
+		return EXIT_FASTPATH_NONE;
+	}
+}
+
+static int handle_exception_nmi(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	struct kvm_run *kvm_run = vcpu->run;
+	u32 intr_info, ex_no, error_code;
+	unsigned long dr6;
+	u32 vect_info;
+
+	vect_info = vmx->idt_vectoring_info;
+	intr_info = vmx_get_intr_info(vcpu);
+
+	/*
+	 * Machine checks are handled by handle_exception_irqoff(), or by
+	 * pkvm_vcpu_run() if a #MC occurs on VM-Entry.  NMIs are handled by
+	 * pkvm_vcpu_run().
+	 */
+	if (is_machine_check(intr_info) || is_nmi(intr_info))
+		return 1;
+
+	if (pkvm_is_protected_vcpu(vcpu))
+		return 1;
+
+	if (is_invalid_opcode(intr_info))
+		return handle_ud(vcpu);
+
+	error_code = 0;
+	if (intr_info & INTR_INFO_DELIVER_CODE_MASK)
+		error_code = vmx->error_code;
+
+	/*
+	 * The #PF with PFEC.RSVD = 1 indicates the guest is accessing
+	 * MMIO, it is better to report an internal error.
+	 * See the comments in __pkvm_handle_exit.
+	 */
+	if ((vect_info & VECTORING_INFO_VALID_MASK) &&
+	    !(is_page_fault(intr_info) && !(error_code & PFERR_RSVD_MASK))) {
+		vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
+		vcpu->run->internal.suberror = KVM_INTERNAL_ERROR_SIMUL_EX;
+		vcpu->run->internal.ndata = 4;
+		vcpu->run->internal.data[0] = vect_info;
+		vcpu->run->internal.data[1] = intr_info;
+		vcpu->run->internal.data[2] = error_code;
+		vcpu->run->internal.data[3] = vcpu->arch.last_vmentry_cpu;
+		return 0;
+	}
+
+	ex_no = intr_info & INTR_INFO_VECTOR_MASK;
+	switch (ex_no) {
+	case DB_VECTOR:
+		dr6 = vmx_get_exit_qual(vcpu);
+		if (WARN_ON_ONCE(!(vcpu->guest_debug &
+			      (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP))))
+			break;
+		kvm_run->debug.arch.dr6 = dr6 | DR6_ACTIVE_LOW;
+		if (vcpu->guest_debug & KVM_GUESTDBG_USE_HW_BP)
+			kvm_run->debug.arch.dr7 = vcpu->arch.guest_debug_dr7;
+		else
+			kvm_run->debug.arch.dr7 = vcpu->arch.dr7;
+		fallthrough;
+	case BP_VECTOR:
+		kvm_run->exit_reason = KVM_EXIT_DEBUG;
+		kvm_run->debug.arch.pc = kvm_get_linear_rip(vcpu);
+		kvm_run->debug.arch.exception = ex_no;
+		break;
+	case AC_VECTOR:
+		if (vmx_guest_inject_ac(vcpu)) {
+			kvm_queue_exception_e(vcpu, AC_VECTOR, error_code);
+			return 1;
+		}
+
+		/*
+		 * Handle split lock. Depending on detection mode this will
+		 * either warn and disable split lock detection for this
+		 * task or force SIGBUS on it.
+		 */
+		if (handle_guest_split_lock(kvm_rip_read(vcpu)))
+			return 1;
+		fallthrough;
+	default:
+		pr_warn("pkvm_high: Unsupported exception_nmi: intr_info 0x%x\n", intr_info);
+		kvm_run->exit_reason = KVM_EXIT_EXCEPTION;
+		kvm_run->ex.exception = ex_no;
+		kvm_run->ex.error_code = error_code;
+		break;
+	}
+
+	return 0;
+}
+
+static __always_inline int handle_external_interrupt(struct kvm_vcpu *vcpu)
+{
+	++vcpu->stat.irq_exits;
+	return 1;
+}
+
+static int handle_triple_fault(struct kvm_vcpu *vcpu)
+{
+	vcpu->run->exit_reason = KVM_EXIT_SHUTDOWN;
+	vcpu->mmio_needed = 0;
+	return 0;
+}
+
+static int handle_nmi_window(struct kvm_vcpu *vcpu)
+{
+	++vcpu->stat.nmi_window_exits;
+	kvm_make_request(KVM_REQ_EVENT, vcpu);
+
+	return 1;
+}
+
+static int pkvm_complete_fast_pio_out(struct kvm_vcpu *vcpu)
+{
+	vcpu->arch.pio.count = 0;
+
+	return pkvm_is_protected_vcpu(vcpu) ? 1 : kvm_skip_emulated_instruction(vcpu);
+}
+
+static int pkvm_fast_pio_out(struct kvm_vcpu *vcpu, int size,
+			    unsigned short port)
+{
+	struct x86_emulate_ctxt *ctxt = vcpu->arch.emulate_ctxt;
+	unsigned long val = kvm_rax_read(vcpu);
+	int ret;
+
+	ret = ctxt->ops->pio_out_emulated(ctxt, size, port, &val, 1);
+	if (ret)
+		return ret;
+
+	vcpu->arch.complete_userspace_io = pkvm_complete_fast_pio_out;
+	return 0;
+}
+
+static int pkvm_complete_fast_pio_in(struct kvm_vcpu *vcpu)
+{
+	unsigned int count = vcpu->arch.pio.count;
+	int size = vcpu->arch.pio.size;
+	unsigned long val;
+
+	/* We should only ever be called with arch.pio.count equal to 1 */
+	BUG_ON(vcpu->arch.pio.count != 1);
+
+	/* For size less than 4 we merge, else we zero extend */
+	val = (vcpu->arch.pio.size < 4) ? kvm_rax_read(vcpu) : 0;
+	memcpy(&val, vcpu->arch.pio_data, size * count);
+
+	trace_kvm_pio(KVM_PIO_IN, vcpu->arch.pio.port, size, count, vcpu->arch.pio_data);
+	vcpu->arch.pio.count = 0;
+	kvm_rax_write(vcpu, val);
+
+	return pkvm_is_protected_vcpu(vcpu) ? 1 : kvm_skip_emulated_instruction(vcpu);
+}
+
+static int pkvm_fast_pio_in(struct kvm_vcpu *vcpu, int size,
+			    unsigned short port)
+{
+	struct x86_emulate_ctxt *ctxt = vcpu->arch.emulate_ctxt;
+	unsigned long val;
+	int ret;
+
+	/* For size less than 4 we merge, else we zero extend */
+	val = (size < 4) ? kvm_rax_read(vcpu) : 0;
+
+	ret = ctxt->ops->pio_in_emulated(ctxt, size, port, &val, 1);
+	if (ret) {
+		kvm_rax_write(vcpu, val);
+		return ret;
+	}
+
+	vcpu->arch.complete_userspace_io = pkvm_complete_fast_pio_in;
+	return 0;
+}
+
+static int handle_io(struct kvm_vcpu *vcpu)
+{
+	unsigned long exit_qualification;
+	int size, in, string;
+	unsigned int port;
+	int ret;
+
+	exit_qualification = vmx_get_exit_qual(vcpu);
+	string = (exit_qualification & 16) != 0;
+
+	++vcpu->stat.io_exits;
+
+	if (string)
+		return kvm_emulate_instruction(vcpu, 0);
+
+	port = exit_qualification >> 16;
+	size = (exit_qualification & 7) + 1;
+	in = (exit_qualification & 8) != 0;
+
+	ret = in ? pkvm_fast_pio_in(vcpu, size, port) :
+		   pkvm_fast_pio_out(vcpu, size, port);
+
+	return pkvm_is_protected_vcpu(vcpu) ?
+			ret : (ret && kvm_skip_emulated_instruction(vcpu));
+}
+
+static int handle_dr(struct kvm_vcpu *vcpu)
+{
+	if ((vcpu->arch.guest_debug_dr7 & DR7_GD) &&
+	    (vcpu->guest_debug & KVM_GUESTDBG_USE_HW_BP)) {
+		vcpu->run->debug.arch.dr6 = DR6_BD | DR6_ACTIVE_LOW;
+		vcpu->run->debug.arch.dr7 = vcpu->arch.guest_debug_dr7;
+		vcpu->run->debug.arch.pc = kvm_get_linear_rip(vcpu);
+		vcpu->run->debug.arch.exception = DB_VECTOR;
+		vcpu->run->exit_reason = KVM_EXIT_DEBUG;
+
+		return 0;
+	}
+
+	return 1;
+}
+
+static int handle_tpr_below_threshold(struct kvm_vcpu *vcpu)
+{
+	kvm_apic_update_ppr(vcpu);
+	return 1;
+}
+
+static int handle_interrupt_window(struct kvm_vcpu *vcpu)
+{
+	kvm_make_request(KVM_REQ_EVENT, vcpu);
+
+	++vcpu->stat.irq_window_exits;
+	return 1;
+}
+
+static int handle_apic_eoi_induced(struct kvm_vcpu *vcpu)
+{
+	unsigned long exit_qualification = vmx_get_exit_qual(vcpu);
+	int vector = exit_qualification & 0xff;
+
+	/* EOI-induced VM exit is trap-like and thus no need to adjust IP */
+	kvm_apic_set_eoi_accelerated(vcpu, vector);
+	return 1;
+}
+
+static int handle_apic_write(struct kvm_vcpu *vcpu)
+{
+	unsigned long exit_qualification = vmx_get_exit_qual(vcpu);
+
+	/*
+	 * APIC-write VM-Exit is trap-like, KVM doesn't need to advance RIP and
+	 * hardware has done any necessary aliasing, offset adjustments, etc...
+	 * for the access.  I.e. the correct value has already been  written to
+	 * the vAPIC page for the correct 16-byte chunk.  KVM needs only to
+	 * retrieve the register value and emulate the access.
+	 */
+	u32 offset = exit_qualification & 0xff0;
+
+	kvm_apic_write_nodecode(vcpu, offset);
+	return 1;
+}
+
+static int handle_machine_check(struct kvm_vcpu *vcpu)
+{
+	/* handled by pkvm_vcpu_run() */
+	return 1;
+}
+
+static int handle_ept_violation(struct kvm_vcpu *vcpu)
+{
+	unsigned long exit_qualification;
+	gpa_t gpa;
+	u64 error_code;
+
+	exit_qualification = vmx_get_exit_qual(vcpu);
+
+	gpa = to_vmx(vcpu)->exit_gpa;
+	trace_kvm_page_fault(vcpu, gpa, exit_qualification);
+
+	/* Is it a read fault? */
+	error_code = (exit_qualification & EPT_VIOLATION_ACC_READ)
+		     ? PFERR_USER_MASK : 0;
+	/* Is it a write fault? */
+	error_code |= (exit_qualification & EPT_VIOLATION_ACC_WRITE)
+		      ? PFERR_WRITE_MASK : 0;
+	/* Is it a fetch fault? */
+	error_code |= (exit_qualification & EPT_VIOLATION_ACC_INSTR)
+		      ? PFERR_FETCH_MASK : 0;
+	/* ept page table entry is present? */
+	error_code |= (exit_qualification & EPT_VIOLATION_RWX_MASK)
+		      ? PFERR_PRESENT_MASK : 0;
+
+	error_code |= (exit_qualification & EPT_VIOLATION_GVA_TRANSLATED) != 0 ?
+	       PFERR_GUEST_FINAL_MASK : PFERR_GUEST_PAGE_MASK;
+
+	return kvm_mmu_page_fault(vcpu, gpa, error_code, NULL, 0);
+}
+
+static int pkvm_check_emulate_instruction(struct kvm_vcpu *vcpu, int emul_type,
+					  void *insn, int insn_len);
+
+static int handle_ept_misconfig(struct kvm_vcpu *vcpu)
+{
+	gpa_t gpa;
+
+	if (pkvm_check_emulate_instruction(vcpu, EMULTYPE_PF, NULL, 0))
+		return 1;
+
+	gpa = to_vmx(vcpu)->exit_gpa;
+	if (!kvm_io_bus_write(vcpu, KVM_FAST_MMIO_BUS, gpa, 0, NULL)) {
+		trace_kvm_fast_mmio(gpa);
+		return kvm_skip_emulated_instruction(vcpu);
+	}
+
+	return kvm_mmu_page_fault(vcpu, gpa, PFERR_RSVD_MASK, NULL, 0);
+}
+
+/*
+ * Indicate a busy-waiting vcpu in spinlock. We do not enable the PAUSE
+ * exiting, so only get here on cpu with PAUSE-Loop-Exiting.
+ */
+static int handle_pause(struct kvm_vcpu *vcpu)
+{
+	/*
+	 * Intel sdm vol3 ch-25.1.3 says: The "PAUSE-loop exiting"
+	 * VM-execution control is ignored if CPL > 0. OTOH, KVM
+	 * never set PAUSE_EXITING and just set PLE if supported,
+	 * so the vcpu must be CPL=0 if it gets a PAUSE exit.
+	 */
+	kvm_vcpu_on_spin(vcpu, true);
+
+	return 1;
+}
+
+static int handle_bus_lock_vmexit(struct kvm_vcpu *vcpu)
+{
+	/*
+	 * The bus_lock_detected flag is set when got the vmexit reason from the
+	 * pkvm hypervisor. Nothing to do here.
+	 */
+	return 1;
+}
+
+static int handle_notify(struct kvm_vcpu *vcpu)
+{
+	unsigned long exit_qual = vmx_get_exit_qual(vcpu);
+	bool context_invalid = exit_qual & NOTIFY_VM_CONTEXT_INVALID;
+
+	++vcpu->stat.notify_window_exits;
+
+	if (vcpu->kvm->arch.notify_vmexit_flags & KVM_X86_NOTIFY_VMEXIT_USER ||
+	    context_invalid) {
+		vcpu->run->exit_reason = KVM_EXIT_NOTIFY;
+		vcpu->run->notify.flags = context_invalid ?
+					  KVM_NOTIFY_CONTEXT_INVALID : 0;
+		return 0;
+	}
+
+	return 1;
+}
+
+static int handle_halt(struct kvm_vcpu *vcpu)
+{
+	return kvm_emulate_halt_noskip(vcpu);
+}
+
+static void wbinvd_ipi(void *garbage)
+{
+	wbinvd();
+}
+
+static inline bool pkvm_has_vmx_wbinvd_exit(void)
+{
+	/* FIXME: Check with the pkvm hypervisor */
+	return true;
+}
+
+static int handle_wbinvd(struct kvm_vcpu *vcpu)
+{
+	if (!kvm_arch_has_noncoherent_dma(vcpu->kvm))
+		return 1;
+
+	if (pkvm_has_vmx_wbinvd_exit()) {
+		int cpu = get_cpu();
+
+		cpumask_set_cpu(cpu, vcpu->arch.wbinvd_dirty_mask);
+		on_each_cpu_mask(vcpu->arch.wbinvd_dirty_mask,
+				wbinvd_ipi, NULL, 1);
+		put_cpu();
+		cpumask_clear(vcpu->arch.wbinvd_dirty_mask);
+	} else
+		wbinvd();
+
+	return 1;
+}
+
+/*
+ * The exit handlers return 1 if the exit was handled fully and guest execution
+ * may resume.  Otherwise they set the kvm_run parameter to indicate what needs
+ * to be done to userspace and return 0.
+ */
+static int (*pkvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+	[EXIT_REASON_EXCEPTION_NMI]           = handle_exception_nmi,
+	[EXIT_REASON_EXTERNAL_INTERRUPT]      = handle_external_interrupt,
+	[EXIT_REASON_TRIPLE_FAULT]            = handle_triple_fault,
+	[EXIT_REASON_NMI_WINDOW]	      = handle_nmi_window,
+	[EXIT_REASON_IO_INSTRUCTION]          = handle_io,
+	[EXIT_REASON_DR_ACCESS]               = handle_dr,
+	[EXIT_REASON_MSR_READ]                = kvm_emulate_rdmsr,
+	[EXIT_REASON_MSR_WRITE]               = kvm_emulate_wrmsr,
+	[EXIT_REASON_INTERRUPT_WINDOW]        = handle_interrupt_window,
+	[EXIT_REASON_HLT]                     = handle_halt,
+	[EXIT_REASON_VMCALL]                  = kvm_emulate_hypercall,
+	[EXIT_REASON_TPR_BELOW_THRESHOLD]     = handle_tpr_below_threshold,
+	[EXIT_REASON_APIC_WRITE]              = handle_apic_write,
+	[EXIT_REASON_EOI_INDUCED]             = handle_apic_eoi_induced,
+	[EXIT_REASON_WBINVD]                  = handle_wbinvd,
+	[EXIT_REASON_MCE_DURING_VMENTRY]      = handle_machine_check,
+	[EXIT_REASON_EPT_VIOLATION]	      = handle_ept_violation,
+	[EXIT_REASON_EPT_MISCONFIG]           = handle_ept_misconfig,
+	[EXIT_REASON_PAUSE_INSTRUCTION]       = handle_pause,
+	[EXIT_REASON_BUS_LOCK]                = handle_bus_lock_vmexit,
+	[EXIT_REASON_NOTIFY]		      = handle_notify,
+};
+
+static const int pkvm_vmx_max_exit_handlers =
+	ARRAY_SIZE(pkvm_vmx_exit_handlers);
+
+static int __pkvm_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	union vmx_exit_reason exit_reason;
+	u16 exit_handler_index;
+	u32 vectoring_info;
+
+	exit_reason = vmx->exit_reason;
+
+	if (exit_reason.failed_vmentry) {
+		vcpu->run->exit_reason = KVM_EXIT_FAIL_ENTRY;
+		vcpu->run->fail_entry.hardware_entry_failure_reason
+			= exit_reason.full;
+		vcpu->run->fail_entry.cpu = vcpu->arch.last_vmentry_cpu;
+		return 0;
+	}
+
+	if (unlikely(vmx->fail)) {
+		vcpu->run->exit_reason = KVM_EXIT_FAIL_ENTRY;
+		vcpu->run->fail_entry.hardware_entry_failure_reason
+			= vmx->error_code;
+		vcpu->run->fail_entry.cpu = vcpu->arch.last_vmentry_cpu;
+		return 0;
+	}
+
+	vectoring_info = vmx->idt_vectoring_info;
+	/*
+	 * Note:
+	 * Do not try to fix EXIT_REASON_EPT_MISCONFIG if it caused by
+	 * delivery event since it indicates guest is accessing MMIO.
+	 * The vm-exit can be triggered again after return to guest that
+	 * will cause infinite loop.
+	 */
+	if ((vectoring_info & VECTORING_INFO_VALID_MASK) &&
+	    (exit_reason.basic != EXIT_REASON_EXCEPTION_NMI &&
+	     exit_reason.basic != EXIT_REASON_EPT_VIOLATION &&
+	     exit_reason.basic != EXIT_REASON_PML_FULL &&
+	     exit_reason.basic != EXIT_REASON_APIC_ACCESS &&
+	     exit_reason.basic != EXIT_REASON_TASK_SWITCH &&
+	     exit_reason.basic != EXIT_REASON_NOTIFY)) {
+		int ndata = 3;
+
+		vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
+		vcpu->run->internal.suberror = KVM_INTERNAL_ERROR_DELIVERY_EV;
+		vcpu->run->internal.data[0] = vectoring_info;
+		vcpu->run->internal.data[1] = exit_reason.full;
+		vcpu->run->internal.data[2] = vmx_get_exit_qual(vcpu);
+		if (exit_reason.basic == EXIT_REASON_EPT_MISCONFIG)
+			vcpu->run->internal.data[ndata++] = vmx->exit_gpa;
+		vcpu->run->internal.data[ndata++] = vcpu->arch.last_vmentry_cpu;
+		vcpu->run->internal.ndata = ndata;
+		return 0;
+	}
+
+	if (exit_fastpath != EXIT_FASTPATH_NONE)
+		return 1;
+
+	if (exit_reason.basic >= pkvm_vmx_max_exit_handlers)
+		goto unexpected_vmexit;
+#ifdef CONFIG_MITIGATION_RETPOLINE
+	if (exit_reason.basic == EXIT_REASON_MSR_WRITE)
+		return kvm_emulate_wrmsr(vcpu);
+	else if (exit_reason.basic == EXIT_REASON_INTERRUPT_WINDOW)
+		return handle_interrupt_window(vcpu);
+	else if (exit_reason.basic == EXIT_REASON_EXTERNAL_INTERRUPT)
+		return handle_external_interrupt(vcpu);
+	else if (exit_reason.basic == EXIT_REASON_HLT)
+		return handle_halt(vcpu);
+	else if (exit_reason.basic == EXIT_REASON_EPT_MISCONFIG)
+		return handle_ept_misconfig(vcpu);
+#endif
+
+	exit_handler_index = array_index_nospec((u16)exit_reason.basic,
+						pkvm_vmx_max_exit_handlers);
+	if (!pkvm_vmx_exit_handlers[exit_handler_index])
+		goto unexpected_vmexit;
+
+	return pkvm_vmx_exit_handlers[exit_handler_index](vcpu);
+
+unexpected_vmexit:
+	vcpu_unimpl(vcpu, "vmx: unexpected exit reason 0x%x\n",
+		    exit_reason.full);
+	vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
+	vcpu->run->internal.suberror =
+			KVM_INTERNAL_ERROR_UNEXPECTED_EXIT_REASON;
+	vcpu->run->internal.ndata = 2;
+	vcpu->run->internal.data[0] = exit_reason.full;
+	vcpu->run->internal.data[1] = vcpu->arch.last_vmentry_cpu;
+	return 0;
+}
+
+static int pkvm_check_processor_compat(void)
+{
+	return pkvm_hypercall(check_processor_compatibility);
+}
+
+static int pkvm_enable_virtualization_cpu(void)
+{
+	unsigned long pv_param_pa = __pa(this_cpu_ptr(&pv_param));
+	int r;
+
+	r = pkvm_hypercall(enable_virtualization_cpu, pv_param_pa);
+	if (r)
+		return r;
+
+	intel_pt_handle_vmx(1);
+	return 0;
+}
+
+static void pkvm_disable_virtualization_cpu(void)
+{
+	intel_pt_handle_vmx(0);
+	pkvm_hypercall(disable_virtualization_cpu);
+}
+
+static void pkvm_emergency_disable_virtualization_cpu(void) { /* TODO */ }
+
+static bool pkvm_has_emulated_msr(struct kvm *kvm, u32 index)
+{
+	switch (index) {
+	case MSR_KVM_WALL_CLOCK:
+	case MSR_KVM_WALL_CLOCK_NEW:
+	case MSR_KVM_SYSTEM_TIME:
+	case MSR_KVM_SYSTEM_TIME_NEW:
+	case MSR_KVM_ASYNC_PF_EN:
+	case MSR_KVM_ASYNC_PF_INT:
+	case MSR_KVM_ASYNC_PF_ACK:
+	case MSR_KVM_STEAL_TIME:
+	case MSR_KVM_PV_EOI_EN:
+	case MSR_KVM_POLL_CONTROL:
+	case MSR_IA32_TSC_ADJUST:
+	case MSR_IA32_TSC:
+	case MSR_IA32_APICBASE:
+	case APIC_BASE_MSR ... APIC_BASE_MSR + 0xff:
+	case MSR_IA32_TSC_DEADLINE:
+		return true;
+	default:
+		/*
+		 * All other emulated MSRs are directly emulated by the pKVM
+		 * hypervisor.
+		 */
+		break;
+	}
+
+	return false;
+}
+
+static int pkvm_vm_init(struct kvm *kvm)
+{
+	struct kvm_protected_vm *pkvm = &kvm->arch.pkvm;
+	size_t pkvm_vm_sz;
+	void *pkvm_vm;
+	void *vm_init_pool;
+	int ret;
+
+	ret = vmx_vm_init(kvm);
+	if (ret)
+		return ret;
+
+	INIT_LIST_HEAD(&pkvm->pinned_pages);
+	spin_lock_init(&pkvm->pinned_page_lock);
+	mutex_init(&pkvm->finalized_lock);
+	pkvm->pvmfw_load_addr = INVALID_GPA;
+
+	pkvm_vm_sz = PAGE_ALIGN(PKVM_SHADOW_VM_SIZE);
+	pkvm_vm = alloc_pages_exact(pkvm_vm_sz, GFP_KERNEL_ACCOUNT);
+	if (!pkvm_vm)
+		return -ENOMEM;
+
+	/* Single page for per VM pool init */
+	vm_init_pool = (void *)__get_free_page(GFP_KERNEL_ACCOUNT);
+	if (!vm_init_pool) {
+		ret = -ENOMEM;
+		goto free_page;
+	}
+
+	kvm_account_pgtable_pages(vm_init_pool, 1);
+
+	ret = kvm_share_hyp(kvm, (void *)kvm + sizeof(struct kvm_vmx));
+	if (ret)
+		goto free_pgtable_page;
+
+	ret = pkvm_hypercall(vm_init, kvm, __pa(pkvm_vm), __pa(vm_init_pool));
+	if (ret < 0)
+		goto unshare;
+
+	pkvm->pkvm_vm_handle = ret;
+
+	if (pkvm_is_protected_vm(kvm))
+		kvm->arch.has_protected_state = true;
+
+	return 0;
+
+unshare:
+	kvm_unshare_hyp(kvm, (void *)kvm + sizeof(struct kvm_vmx));
+free_pgtable_page:
+	kvm_account_pgtable_pages(vm_init_pool, -1);
+	free_page((unsigned long)vm_init_pool);
+free_page:
+	free_pages_exact(pkvm_vm, pkvm_vm_sz);
+	return ret;
+}
+
+static void pkvm_vm_destroy(struct kvm *kvm)
+{
+	struct kvm_protected_vm *pkvm = &kvm->arch.pkvm;
+	struct kvm_pinned_page *ppage, *n;
+	int ret;
+
+	ret = pkvm_hypercall(vm_destroy, pkvm->pkvm_vm_handle);
+	if (ret)
+		return;
+
+	kvm_unshare_hyp(kvm, (void *)kvm + sizeof(struct kvm_vmx));
+
+	free_pkvm_memcache(&pkvm->teardown_mc);
+	free_pkvm_memcache(&pkvm->guest_mmu_teardown_mc);
+
+	list_for_each_entry_safe(ppage, n, &pkvm->pinned_pages, list) {
+		list_del(&ppage->list);
+		put_page(ppage->page);
+		kfree(ppage);
+	}
+
+	vmx_vm_destroy(kvm);
+}
+
+static void pkvm_unshare_vcpu(struct kvm_vcpu *vcpu)
+{
+	struct kvm_lapic *apic = vcpu->arch.apic;
+
+	if (apic) {
+		kvm_unshare_hyp(apic->regs, apic->regs + PAGE_SIZE);
+		kvm_unshare_hyp(apic, (void *)apic + sizeof(struct kvm_lapic));
+	}
+
+	kvm_unshare_hyp(vcpu, (void *)vcpu + sizeof(struct vcpu_vmx));
+}
+
+static int pkvm_share_vcpu(struct kvm_vcpu *vcpu)
+{
+	struct kvm_lapic *apic = vcpu->arch.apic;
+	int ret;
+
+	ret = kvm_share_hyp(vcpu, (void *)vcpu + sizeof(struct vcpu_vmx));
+	if (ret || !apic)
+		return ret;
+
+	ret = kvm_share_hyp(apic, (void *)apic + sizeof(struct kvm_lapic));
+	if (ret)
+		goto unshare_vcpu;
+
+	ret = kvm_share_hyp(apic->regs, apic->regs + PAGE_SIZE);
+	if (ret)
+		goto unshare_apic;
+
+	return 0;
+
+unshare_apic:
+	kvm_unshare_hyp(apic, (void *)apic + sizeof(struct kvm_lapic));
+unshare_vcpu:
+	kvm_unshare_hyp(vcpu, (void *)vcpu + sizeof(struct vcpu_vmx));
+	return ret;
+}
+
+static int pkvm_vcpu_create(struct kvm_vcpu *vcpu)
+{
+	size_t pkvm_vcpu_sz, fpu_sz;
+	void *pkvm_vcpu, *fpu;
+	struct vcpu_vmx *vmx;
+	struct page *page;
+	int ret;
+
+	BUILD_BUG_ON(offsetof(struct vcpu_vmx, vcpu) != 0);
+	vmx = to_vmx(vcpu);
+
+	INIT_LIST_HEAD(&vmx->pi_wakeup_list);
+
+	/*
+	 * If PML is turned on, failure on enabling PML just results in failure
+	 * of creating the vcpu, therefore we can simplify PML logic (by
+	 * avoiding dealing with cases, such as enabling PML partially on vcpus
+	 * for the guest), etc.
+	 */
+	if (enable_pml) {
+		page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+		if (!page)
+			return -ENOMEM;
+		vmx->pml_pg = page_to_virt(page);
+	}
+
+	ret = pkvm_alloc_loaded_vmcs(&vmx->vmcs01);
+	if (ret < 0)
+		goto free_pml;
+
+	vmx->loaded_vmcs = &vmx->vmcs01;
+	vmx->loaded_vmcs->cpu = -1;
+
+	ret = -ENOMEM;
+
+	if (vmcs_config.cpu_based_2nd_exec_ctrl & SECONDARY_EXEC_EPT_VIOLATION_VE) {
+		BUILD_BUG_ON(sizeof(*vmx->ve_info) > PAGE_SIZE);
+
+		/* ve_info must be page aligned. */
+		page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+		if (!page)
+			goto free_vmcs;
+
+		vmx->ve_info = page_to_virt(page);
+	}
+
+	pkvm_vcpu_sz = PAGE_ALIGN(PKVM_SHADOW_VCPU_STATE_SIZE);
+	pkvm_vcpu = alloc_pages_exact(pkvm_vcpu_sz, GFP_KERNEL_ACCOUNT);
+	if (!pkvm_vcpu)
+		goto free_ve;
+
+	fpu_sz = pkvm_guest_initial_fpstate_size(vcpu->kvm);
+	fpu = alloc_pages_exact(fpu_sz, GFP_KERNEL_ACCOUNT);
+	if (!fpu)
+		goto free_vcpu;
+
+	ret = pkvm_share_vcpu(vcpu);
+	if (ret)
+		goto free_fpu;
+
+	ret = pkvm_hypercall(vcpu_create, vcpu, __pa(pkvm_vcpu), __pa(fpu));
+	if (ret < 0)
+		goto unshare;
+
+	vcpu->arch.pkvm_vcpu.handle = ret;
+
+	init_pkvm_mmu_memcache(&vcpu->arch.pkvm_vcpu.guest_mmu_memcache);
+
+	return 0;
+
+unshare:
+	pkvm_unshare_vcpu(vcpu);
+free_fpu:
+	free_pages_exact(fpu, fpu_sz);
+free_vcpu:
+	free_pages_exact(pkvm_vcpu, pkvm_vcpu_sz);
+free_ve:
+	free_ve_info(vmx);
+free_vmcs:
+	pkvm_free_loaded_vmcs(vmx->loaded_vmcs);
+free_pml:
+	free_pml_buffer(vmx);
+	return ret;
+}
+
+static void pkvm_vcpu_free(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	int ret;
+
+	pkvm_vcpu_unload(vcpu);
+
+	ret = pkvm_hypercall(vcpu_free, vcpu);
+	if (ret) {
+		pr_err("pkvm: failed to free pkvm_vcpu, err %d\n", ret);
+		return;
+	}
+
+	pkvm_unshare_vcpu(vcpu);
+
+	free_pkvm_memcache(&vcpu->kvm->arch.pkvm.teardown_mc);
+
+	if (enable_pml)
+		free_pml_buffer(vmx);
+	pkvm_free_loaded_vmcs(vmx->loaded_vmcs);
+	free_ve_info(vmx);
+}
+
+static void pkvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+
+	if (!vcpu->arch.guest_state_protected && init_event)
+		pkvm_hypercall(vcpu_reset, vcpu, init_event);
+
+	/*
+	 * The host response to inject interrupts to the guest. The pi_desc is
+	 * the key structure for the host to inject interrupts via the posted
+	 * interrupt mechanism. Its physical address is used for the
+	 * POSTED_INTR_DESC_ADDR in the VMCS by the pkvm hypervisor. Initialize
+	 * the pi_desc when reset vcpu.
+	 */
+	vmx->pi_desc.nv = POSTED_INTR_VECTOR;
+	__pi_set_sn(&vmx->pi_desc);
+
+	/*
+	 * The CR0/CR4 guest-owned/rsvd bits are controlled by the pkvm
+	 * hypervisor. The host VMM can assume all the bits in CR0/CR4 are owned
+	 * by the guest.
+	 */
+	vcpu->arch.cr0_guest_owned_bits = ~0;
+	vcpu->arch.cr4_guest_owned_bits = ~0;
+	vcpu->arch.cr4_guest_rsvd_bits = 0;
+
+	kvm_set_cr8(vcpu, 0);
+	kvm_make_request(KVM_REQ_APIC_PAGE_RELOAD, vcpu);
+
+	/* Enable x2apic by default */
+	if (pkvm_is_protected_vcpu(vcpu)) {
+		struct msr_data apic_base_msr;
+
+		apic_base_msr.data = APIC_DEFAULT_PHYS_BASE |
+				     LAPIC_MODE_X2APIC |
+				     (kvm_vcpu_is_reset_bsp(vcpu) ? MSR_IA32_APICBASE_BSP : 0);
+		apic_base_msr.host_initiated = true;
+
+		kvm_set_apic_base(vcpu, &apic_base_msr);
+	}
+}
+
+static void pkvm_prepare_switch_to_guest(struct kvm_vcpu *vcpu) {}
+
+static void pkvm_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	bool already_loaded;
+
+	already_loaded = vmx->loaded_vmcs->cpu == cpu;
+	if (!already_loaded)
+		pkvm_vcpu_unload(vcpu);
+
+	pkvm_hypercall(vcpu_load, vcpu, cpu);
+
+	if (!already_loaded)
+		vmx->loaded_vmcs->cpu = cpu;
+
+	vmx_vcpu_pi_load(vcpu, cpu);
+}
+
+static void pkvm_vcpu_put(struct kvm_vcpu *vcpu)
+{
+	vmx_vcpu_pi_put(vcpu);
+}
+
+static void pkvm_update_exception_bitmap(struct kvm_vcpu *vcpu)
+{
+	if (vcpu->arch.guest_state_protected)
+		return;
+
+	pkvm_hypercall(update_exception_bitmap, vcpu);
+}
+
+static int pkvm_get_feature_msr(u32 msr, u64 *data)
+{
+	switch (msr) {
+	case KVM_FIRST_EMULATED_VMX_MSR ... KVM_LAST_EMULATED_VMX_MSR:
+		return 1;
+	default:
+		return KVM_MSR_RET_UNSUPPORTED;
+	}
+}
+
+static int pkvm_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+{
+	if (pkvm_has_emulated_msr(vcpu->kvm, msr_info->index))
+		return kvm_get_msr_common(vcpu, msr_info);
+
+	if (!vcpu->arch.guest_state_protected) {
+		struct msr_data *msr = get_this_pv_param(msr);
+		int ret;
+
+		*msr = *msr_info;
+		ret = pkvm_hypercall(get_msr, vcpu, msr);
+		msr_info->data = msr->data;
+		put_this_pv_param(msr);
+
+		return ret;
+	}
+
+	return 1;
+}
+
+static int pkvm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+{
+	if (pkvm_has_emulated_msr(vcpu->kvm, msr_info->index))
+		return kvm_set_msr_common(vcpu, msr_info);
+
+	if (!vcpu->arch.guest_state_protected) {
+		struct msr_data *msr = get_this_pv_param(msr);
+		int ret;
+
+		*msr = *msr_info;
+		ret = pkvm_hypercall(set_msr, vcpu, msr);
+		put_this_pv_param(msr);
+
+		return ret;
+	}
+
+	return 1;
+}
+
+static u64 pkvm_get_segment_base(struct kvm_vcpu *vcpu, int seg)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	ulong *p;
+
+	if (vcpu->arch.guest_state_protected)
+		return 0;
+
+	p = &vmx->segment_cache.seg[seg].base;
+
+	if (!pkvm_segment_cache_test(vmx, seg, SEG_FIELD_BASE)) {
+		*p = pkvm_hypercall(get_segment_base, vcpu, seg);
+		pkvm_segment_cache_set(vmx, seg, SEG_FIELD_BASE);
+	}
+
+	return *p;
+}
+
+static void pkvm_get_segment(struct kvm_vcpu *vcpu, struct kvm_segment *var, int seg)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	struct kvm_save_segment *segment;
+	u32 ar;
+
+	if (vcpu->arch.guest_state_protected) {
+		memset(var, 0, sizeof(*var));
+		return;
+	}
+
+	if (!pkvm_segment_cache_test(vmx, seg, SEG_FIELD_SEL) ||
+	    !pkvm_segment_cache_test(vmx, seg, SEG_FIELD_BASE) ||
+	    !pkvm_segment_cache_test(vmx, seg, SEG_FIELD_LIMIT) ||
+	    !pkvm_segment_cache_test(vmx, seg, SEG_FIELD_AR)) {
+		struct kvm_segment *pkvm_var = get_this_pv_param(seg);
+
+		pkvm_hypercall(get_segment, vcpu, pkvm_var, seg);
+
+		pkvm_cache_segment(vmx, pkvm_var, seg);
+
+		put_this_pv_param(pkvm_var);
+	}
+
+	segment = &vmx->segment_cache.seg[seg];
+	var->selector = segment->selector;
+	var->base = segment->base;
+	var->limit = segment->limit;
+	ar = segment->ar;
+	var->unusable = (ar >> 16) & 1;
+	var->type = ar & 15;
+	var->s = (ar >> 4) & 1;
+	var->dpl = (ar >> 5) & 3;
+	/*
+	 * Some userspaces do not preserve unusable property. Since usable
+	 * segment has to be present according to VMX spec we can use present
+	 * property to amend userspace bug by making unusable segment always
+	 * nonpresent. vmx_segment_access_rights() already marks nonpresent
+	 * segment as unusable.
+	 */
+	var->present = !var->unusable;
+	var->avl = (ar >> 12) & 1;
+	var->l = (ar >> 13) & 1;
+	var->db = (ar >> 14) & 1;
+	var->g = (ar >> 15) & 1;
+}
+
+static void pkvm_set_segment(struct kvm_vcpu *vcpu, struct kvm_segment *var, int seg)
+{
+	struct kvm_segment *pkvm_var;
+
+	if (vcpu->arch.guest_state_protected)
+		return;
+
+	pkvm_var = get_this_pv_param(seg);
+	*pkvm_var = *var;
+	pkvm_hypercall(set_segment, vcpu, pkvm_var, seg);
+	put_this_pv_param(pkvm_var);
+}
+
+static int pkvm_get_cpl(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	int seg = VCPU_SREG_SS;
+	u32 ar;
+
+	if (vcpu->arch.guest_state_protected ||
+	    WARN_ON_ONCE(!pkvm_segment_cache_test(vmx, seg, SEG_FIELD_AR)))
+		return 0;
+
+	ar = vmx->segment_cache.seg[seg].ar;
+	return VMX_AR_DPL(ar);
+}
+
+static void pkvm_get_cs_db_l_bits(struct kvm_vcpu *vcpu, int *db, int *l)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	int seg = VCPU_SREG_CS;
+	u32 ar;
+
+	if (vcpu->arch.guest_state_protected ||
+	    WARN_ON_ONCE(!pkvm_segment_cache_test(vmx, seg, SEG_FIELD_AR))) {
+		*db = *l = 0;
+		return;
+	}
+
+	ar = vmx->segment_cache.seg[seg].ar;
+	*db = (ar >> 14) & 1;
+	*l = (ar >> 13) & 1;
+}
+
+static bool pkvm_is_valid_cr0(struct kvm_vcpu *vcpu, unsigned long cr0)
+{
+	return true;
+}
+
+static void pkvm_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0)
+{
+	if (!vcpu->arch.guest_state_protected)
+		pkvm_hypercall(set_cr0, vcpu, cr0);
+
+	vcpu->arch.cr0 = cr0;
+}
+
+static void pkvm_post_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
+{
+	if (vcpu->arch.guest_state_protected)
+		return;
+
+	pkvm_hypercall(post_set_cr3, vcpu, cr3);
+}
+
+static bool pkvm_is_valid_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
+{
+	/* No VMX emulation in the pkvm hypervisor */
+	if (cr4 & X86_CR4_VMXE)
+		return false;
+
+	return true;
+}
+
+static void pkvm_set_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
+{
+	if (!vcpu->arch.guest_state_protected)
+		pkvm_hypercall(set_cr4, vcpu, cr4);
+
+	vcpu->arch.cr4 = cr4;
+}
+
+static int pkvm_set_efer(struct kvm_vcpu *vcpu, u64 efer)
+{
+	int ret = -EINVAL;
+
+	if (!vcpu->arch.guest_state_protected)
+		ret = pkvm_hypercall(set_efer, vcpu, efer);
+
+	vcpu->arch.efer = efer;
+	return ret;
+}
+
+static void pkvm_access_idt_gdt(struct kvm_vcpu *vcpu, struct desc_ptr *dt,
+				bool set, bool idt)
+{
+	struct desc_ptr *desc;
+
+	if (vcpu->arch.guest_state_protected) {
+		if (!set)
+			memset(dt, 0, sizeof(*dt));
+		return;
+	}
+
+	desc = get_this_pv_param(desc);
+
+	if (set) {
+		desc->size = dt->size;
+		desc->address = dt->address;
+		if (idt)
+			pkvm_hypercall(set_idt, vcpu, desc);
+		else
+			pkvm_hypercall(set_gdt, vcpu, desc);
+	} else {
+		if (idt)
+			pkvm_hypercall(get_idt, vcpu, desc);
+		else
+			pkvm_hypercall(get_gdt, vcpu, desc);
+		dt->size = desc->size;
+		dt->address = desc->address;
+	}
+
+	put_this_pv_param(desc);
+}
+
+static void pkvm_get_idt(struct kvm_vcpu *vcpu, struct desc_ptr *dt)
+{
+	pkvm_access_idt_gdt(vcpu, dt, false, true);
+}
+
+static void pkvm_set_idt(struct kvm_vcpu *vcpu, struct desc_ptr *dt)
+{
+	pkvm_access_idt_gdt(vcpu, dt, true, true);
+}
+
+static void pkvm_get_gdt(struct kvm_vcpu *vcpu, struct desc_ptr *dt)
+{
+	pkvm_access_idt_gdt(vcpu, dt, false, false);
+}
+
+static void pkvm_set_gdt(struct kvm_vcpu *vcpu, struct desc_ptr *dt)
+{
+	pkvm_access_idt_gdt(vcpu, dt, true, false);
+}
+
+static void pkvm_set_dr7(struct kvm_vcpu *vcpu, unsigned long val)
+{
+	if (vcpu->arch.guest_state_protected)
+		return;
+
+	pkvm_hypercall(set_dr7, vcpu, val);
+}
+
+static void pkvm_sync_dirty_debug_regs(struct kvm_vcpu *vcpu) {}
+
+static void pkvm_cache_reg(struct kvm_vcpu *vcpu, enum kvm_reg reg)
+{
+	kvm_register_mark_available(vcpu, reg);
+
+	if (vcpu->arch.guest_state_protected)
+		return;
+
+	switch (reg) {
+	case VCPU_REGS_RSP:
+	case VCPU_REGS_RIP:
+	case VCPU_EXREG_PDPTR:
+	case VCPU_EXREG_CR0:
+	case VCPU_EXREG_CR3:
+	case VCPU_EXREG_CR4:
+		pkvm_hypercall(cache_reg, vcpu, reg);
+		break;
+	default:
+		KVM_BUG_ON(1, vcpu->kvm);
+		break;
+	}
+}
+
+static unsigned long pkvm_get_rflags(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+
+	if (!kvm_register_is_available(vcpu, VCPU_EXREG_RFLAGS)) {
+		kvm_register_mark_available(vcpu, VCPU_EXREG_RFLAGS);
+		if (vcpu->arch.guest_state_protected)
+			vmx->rflags = 0;
+		else
+			vmx->rflags = pkvm_hypercall(get_rflags, vcpu);
+	}
+
+	return vmx->rflags;
+}
+
+static void pkvm_set_rflags(struct kvm_vcpu *vcpu, unsigned long rflags)
+{
+	kvm_register_mark_available(vcpu, VCPU_EXREG_RFLAGS);
+	to_vmx(vcpu)->rflags = rflags;
+	if (vcpu->arch.guest_state_protected)
+		return;
+	pkvm_hypercall(set_rflags, vcpu, rflags);
+}
+
+static bool pkvm_get_if_flag(struct kvm_vcpu *vcpu)
+{
+	return pkvm_get_rflags(vcpu) & X86_EFLAGS_IF;
+}
+
+static void pkvm_flush_tlb_all(struct kvm_vcpu *vcpu)
+{
+	pkvm_hypercall(flush_tlb_all, vcpu);
+}
+
+static void pkvm_flush_tlb_current(struct kvm_vcpu *vcpu)
+{
+	pkvm_hypercall(flush_tlb_current, vcpu);
+}
+
+static void pkvm_flush_tlb_gva(struct kvm_vcpu *vcpu, gva_t addr)
+{
+	pkvm_hypercall(flush_tlb_gva, vcpu, addr);
+}
+
+static void pkvm_flush_tlb_guest(struct kvm_vcpu *vcpu)
+{
+	pkvm_hypercall(flush_tlb_guest, vcpu);
+}
+
+void vmx_do_nmi_irqoff(void);
+
+static int pkvm_vcpu_pre_run(struct kvm_vcpu *vcpu)
+{
+	struct kvm_protected_vm *pkvm = &vcpu->kvm->arch.pkvm;
+	int ret;
+
+	if (unlikely(pkvm_is_protected_vcpu(vcpu) && !kvm_vcpu_has_run(vcpu) &&
+		     kvm_vcpu_is_reset_bsp(vcpu))) {
+		mutex_lock(&pkvm->finalized_lock);
+		ret = pkvm_hypercall(vm_finalize, pkvm->pkvm_vm_handle);
+		mutex_unlock(&pkvm->finalized_lock);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 1;
+}
+
+static fastpath_t pkvm_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
+{
+	bool force_immediate_exit = run_flags & KVM_RUN_FORCE_IMMEDIATE_EXIT;
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	unsigned long reqs_to_host;
+	fastpath_t exit_fastpath;
+
+	/* Record the guest's net vcpu time for enforced NMI injections. */
+	if (unlikely(!enable_vnmi &&
+		     vmx->loaded_vmcs->soft_vnmi_blocked))
+		vmx->loaded_vmcs->entry_time = ktime_get();
+
+	trace_kvm_entry(vcpu, force_immediate_exit);
+
+	kvm_wait_lapic_expire(vcpu);
+
+	guest_state_enter_irqoff();
+
+	vcpu->arch.nmi_injected = false;
+	kvm_clear_exception_queue(vcpu);
+	kvm_clear_interrupt_queue(vcpu);
+
+	vmx->exit_reason.full = 0xdead;
+	vmx->fail = 0;
+
+	vcpu->arch.regs_avail &= ~VMX_REGS_LAZY_LOAD_SET;
+	reqs_to_host = pkvm_hypercall(vcpu_run, vcpu, force_immediate_exit);
+	vcpu->arch.regs_dirty = 0;
+
+	/*
+	 * FIXME: The host still needs to pre-configure pVM's vcpu state for
+	 * booting. Once the vcpu has started running, this will be dis-allowed
+	 * by the pkvm hypervisor. So the guest_state_protected flag has to be
+	 * set after the vcpu has started running. This is a temporary solution.
+	 * Once the host doesn't need to do so, then the guest_state_protected
+	 * can be enabled earlier.
+	 */
+	if (unlikely(vcpu->kvm->arch.has_protected_state &&
+		     !vcpu->arch.guest_state_protected)) {
+		vcpu->arch.guest_state_protected = true;
+		/*
+		 * Mark the guest_fpu as confidential to avoid the host VM
+		 * switching FPU for the pVM as this will be done by the pkvm
+		 * hypervisor.
+		 */
+		fpstate_set_confidential(&vcpu->arch.guest_fpu);
+	}
+
+	if (unlikely(vmx->exit_reason.full == 0xdead)) {
+		vmx->fail = 1;
+	} else if ((u16)vmx->exit_reason.basic == EXIT_REASON_EXCEPTION_NMI &&
+	    is_nmi(vmx_get_intr_info(vcpu))) {
+		kvm_before_interrupt(vcpu, KVM_HANDLING_NMI);
+		if (cpu_feature_enabled(X86_FEATURE_FRED))
+			fred_entry_from_kvm(EVENT_TYPE_NMI, NMI_VECTOR);
+		else
+			vmx_do_nmi_irqoff();
+		kvm_after_interrupt(vcpu);
+	}
+
+	guest_state_exit_irqoff();
+
+	if (unlikely(vmx->fail))
+		return EXIT_FASTPATH_NONE;
+
+	if (unlikely((u16)vmx->exit_reason.basic == EXIT_REASON_MCE_DURING_VMENTRY))
+		kvm_machine_check();
+
+	trace_kvm_exit(vcpu, KVM_ISA_VMX);
+
+	if (unlikely(vmx->exit_reason.failed_vmentry))
+		return EXIT_FASTPATH_NONE;
+
+	if (unlikely(!enable_vnmi &&
+		     vmx->loaded_vmcs->soft_vnmi_blocked))
+		vmx->loaded_vmcs->vnmi_blocked_time +=
+			ktime_to_ns(ktime_sub(ktime_get(),
+					      vmx->loaded_vmcs->entry_time));
+
+	if (vcpu->arch.exception.pending || vcpu->arch.exception.injected)
+		kvm_make_request(KVM_REQ_EVENT, vcpu);
+
+	exit_fastpath = EXIT_FASTPATH_EXIT_HANDLED;
+	if (reqs_to_host) {
+		if (test_and_clear_bit(HOST_HANDLE_EXIT, &reqs_to_host))
+			exit_fastpath = EXIT_FASTPATH_NONE;
+
+		if (test_and_clear_bit(HOST_RESET_MMU, &reqs_to_host))
+			kvm_mmu_reset_context(vcpu);
+
+		if (test_and_clear_bit(HOST_INIT_MMU, &reqs_to_host))
+			kvm_init_mmu(vcpu);
+
+		if (test_and_clear_bit(HOST_HANDLE_GUESTDBG_SINGLESTEP, &reqs_to_host)) {
+			struct kvm_run *kvm_run = vcpu->run;
+
+			kvm_run->debug.arch.dr6 = DR6_BS | DR6_ACTIVE_LOW;
+			kvm_run->debug.arch.pc = kvm_get_linear_rip(vcpu);
+			kvm_run->debug.arch.exception = DB_VECTOR;
+			kvm_run->exit_reason = KVM_EXIT_DEBUG;
+
+			exit_fastpath = EXIT_FASTPATH_EXIT_USERSPACE;
+		}
+	}
+
+	if (exit_fastpath == EXIT_FASTPATH_EXIT_HANDLED ||
+	    exit_fastpath == EXIT_FASTPATH_EXIT_USERSPACE)
+		return exit_fastpath;
+
+	return pkvm_exit_handlers_fastpath(vcpu);
+}
+
+static int pkvm_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+{
+	int ret = __pkvm_handle_exit(vcpu, exit_fastpath);
+
+	/*
+	 * Exit to user space when bus lock detected to inform that there is
+	 * a bus lock in guest.
+	 */
+	if (to_vmx(vcpu)->exit_reason.bus_lock_detected) {
+		if (ret > 0)
+			vcpu->run->exit_reason = KVM_EXIT_X86_BUS_LOCK;
+
+		vcpu->run->flags |= KVM_RUN_X86_BUS_LOCK;
+		return 0;
+	}
+	return ret;
+}
+
+static int pkvm_skip_emulated_instruction(struct kvm_vcpu *vcpu)
+{
+	if (vcpu->arch.guest_state_protected)
+		return 1;
+
+	if (vcpu->arch.event_exit_inst_len) {
+		unsigned long rip, orig_rip;
+
+		orig_rip = kvm_rip_read(vcpu);
+		rip = orig_rip + vcpu->arch.event_exit_inst_len;
+#ifdef CONFIG_X86_64
+		/*
+		 * We need to mask out the high 32 bits of RIP if not in 64-bit
+		 * mode, but just finding out that we are in 64-bit mode is
+		 * quite expensive.  Only do it if there was a carry.
+		 */
+		if (unlikely(((rip ^ orig_rip) >> 31) == 3) && !is_64_bit_mode(vcpu))
+			rip = (u32)rip;
+#endif
+		kvm_rip_write(vcpu, rip);
+	} else if (!kvm_emulate_instruction(vcpu, EMULTYPE_SKIP)) {
+		return 0;
+	}
+
+	/* skipping an emulated instruction also counts */
+	pkvm_hypercall(set_interrupt_shadow, vcpu, 0);
+
+	return 1;
+}
+
+static void pkvm_update_emulated_instruction(struct kvm_vcpu *vcpu) {}
+
+static void pkvm_set_interrupt_shadow(struct kvm_vcpu *vcpu, int mask)
+{
+	if (vcpu->arch.guest_state_protected)
+		return;
+
+	pkvm_hypercall(set_interrupt_shadow, vcpu, mask);
+}
+
+static u32 pkvm_get_interrupt_shadow(struct kvm_vcpu *vcpu)
+{
+	if (vcpu->arch.guest_state_protected)
+		return 0;
+
+	return pkvm_hypercall(get_interrupt_shadow, vcpu);
+}
+
+static void pkvm_inject_irq(struct kvm_vcpu *vcpu, bool reinjected)
+{
+	trace_kvm_inj_virq(vcpu->arch.interrupt.nr,
+			   vcpu->arch.interrupt.soft, reinjected);
+
+	++vcpu->stat.irq_injections;
+
+	pkvm_hypercall(inject_irq, vcpu);
+}
+
+static void pkvm_inject_nmi(struct kvm_vcpu *vcpu)
+{
+	++vcpu->stat.nmi_injections;
+
+	pkvm_hypercall(inject_nmi, vcpu);
+}
+
+static void pkvm_inject_exception(struct kvm_vcpu *vcpu)
+{
+	KVM_BUG_ON(pkvm_is_protected_vcpu(vcpu), vcpu->kvm);
+
+	pkvm_hypercall(inject_exception, vcpu);
+}
+
+static void pkvm_cancel_injection(struct kvm_vcpu *vcpu)
+{
+	vcpu->arch.nmi_injected = false;
+	kvm_clear_exception_queue(vcpu);
+	kvm_clear_interrupt_queue(vcpu);
+
+	pkvm_hypercall(cancel_injection, vcpu);
+
+	if (vcpu->arch.nmi_injected ||
+	    vcpu->arch.interrupt.injected ||
+	    vcpu->arch.exception.injected)
+		kvm_make_request(KVM_REQ_EVENT, vcpu);
+}
+
+static int pkvm_interrupt_allowed(struct kvm_vcpu *vcpu, bool for_injection)
+{
+	return pkvm_hypercall(interrupt_allowed, vcpu, for_injection);
+}
+
+static int pkvm_nmi_allowed(struct kvm_vcpu *vcpu, bool for_injection)
+{
+	return pkvm_hypercall(nmi_allowed, vcpu, for_injection);
+}
+
+static bool pkvm_get_nmi_mask(struct kvm_vcpu *vcpu)
+{
+	return pkvm_hypercall(get_nmi_mask, vcpu);
+}
+
+static void pkvm_set_nmi_mask(struct kvm_vcpu *vcpu, bool masked)
+{
+	if (vcpu->arch.guest_state_protected)
+		return;
+
+	pkvm_hypercall(set_nmi_mask, vcpu, masked);
+}
+
+static void pkvm_enable_nmi_window(struct kvm_vcpu *vcpu)
+{
+	pkvm_hypercall(enable_nmi_window, vcpu);
+}
+
+static void pkvm_enable_irq_window(struct kvm_vcpu *vcpu)
+{
+	pkvm_hypercall(enable_irq_window, vcpu);
+}
+
+static void pkvm_update_cr8_intercept(struct kvm_vcpu *vcpu, int tpr, int irr)
+{
+	pkvm_hypercall(update_cr8_intercept, vcpu, tpr, irr);
+}
+
+static void pkvm_set_virtual_apic_mode(struct kvm_vcpu *vcpu)
+{
+	if (!lapic_in_kernel(vcpu))
+		return;
+
+	pkvm_hypercall(set_virtual_apic_mode, vcpu, vcpu->arch.apic_base);
+}
+
+static void pkvm_set_apic_access_page_addr(struct kvm_vcpu *vcpu)
+{
+	/* No virtual apic access support in the pkvm hypervisor */
+}
+
+static void pkvm_refresh_apicv_exec_ctrl(struct kvm_vcpu *vcpu)
+{
+	pkvm_hypercall(refresh_apicv_exec_ctrl, vcpu);
+}
+
+static void pkvm_load_eoi_exitmap(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
+{
+	u64 *exitmap;
+
+	if (!kvm_vcpu_apicv_active(vcpu))
+		return;
+
+	exitmap = get_this_pv_param(eoi_exit_bitmap[0]);
+
+	exitmap[0] = eoi_exit_bitmap[0];
+	exitmap[1] = eoi_exit_bitmap[1];
+	exitmap[2] = eoi_exit_bitmap[2];
+	exitmap[3] = eoi_exit_bitmap[3];
+
+	pkvm_hypercall(load_eoi_exitmap, vcpu, exitmap);
+
+	put_this_pv_param(exitmap);
+}
+
+static void pkvm_hwapic_irr_update(struct kvm_vcpu *vcpu, int max_irr)
+{
+	pkvm_hypercall(hwapic_irr_update, vcpu, max_irr);
+}
+
+static void pkvm_hwapic_isr_update(struct kvm_vcpu *vcpu, int max_isr)
+{
+	pkvm_hypercall(hwapic_isr_update, vcpu, max_isr);
+}
+
+static int pkvm_sync_pir_to_irr(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	int max_irr;
+	bool got_posted_interrupt;
+
+	if (KVM_BUG_ON(!enable_apicv, vcpu->kvm))
+		return -EIO;
+
+	if (pi_test_on(&vmx->pi_desc)) {
+		pi_clear_on(&vmx->pi_desc);
+		/*
+		 * IOMMU can write to PID.ON, so the barrier matters even on UP.
+		 * But on x86 this is just a compiler barrier anyway.
+		 */
+		smp_mb__after_atomic();
+		got_posted_interrupt =
+			kvm_apic_update_irr(vcpu, vmx->pi_desc.pir, &max_irr);
+	} else {
+		max_irr = kvm_lapic_find_highest_irr(vcpu);
+		got_posted_interrupt = false;
+	}
+
+	/*
+	 * Newly recognized interrupts are injected via either virtual interrupt
+	 * delivery (RVI) or KVM_REQ_EVENT.  Virtual interrupt delivery is
+	 * disabled in two cases:
+	 *
+	 * 1) If L2 is running and the vCPU has a new pending interrupt.  If L1
+	 * wants to exit on interrupts, KVM_REQ_EVENT is needed to synthesize a
+	 * VM-Exit to L1.  If L1 doesn't want to exit, the interrupt is injected
+	 * into L2, but KVM doesn't use virtual interrupt delivery to inject
+	 * interrupts into L2, and so KVM_REQ_EVENT is again needed.
+	 *
+	 * 2) If APICv is disabled for this vCPU, assigned devices may still
+	 * attempt to post interrupts.  The posted interrupt vector will cause
+	 * a VM-Exit and the subsequent entry will call sync_pir_to_irr.
+	 */
+	if (!is_guest_mode(vcpu) && kvm_vcpu_apicv_active(vcpu) && max_irr != -1)
+		pkvm_hypercall(hwapic_irr_update, vcpu, max_irr);
+	else if (got_posted_interrupt)
+		kvm_make_request(KVM_REQ_EVENT, vcpu);
+
+	return max_irr;
+}
+
+static void pkvm_get_exit_info(struct kvm_vcpu *vcpu, u32 *reason, u64 *info1,
+			       u64 *info2, u32 *intr_info, u32 *error_code)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+
+	*reason = vmx->exit_reason.full;
+	*info1 = vmx_get_exit_qual(vcpu);
+	if (!(vmx->exit_reason.failed_vmentry)) {
+		*info2 = vmx->idt_vectoring_info;
+		*intr_info = vmx->exit_intr_info;
+		if (is_exception_with_error_code(*intr_info))
+			*error_code = vmx->error_code;
+		else
+			*error_code = 0;
+	} else {
+		*info2 = 0;
+		*intr_info = 0;
+		*error_code = 0;
+	}
+}
+
+static int pkvm_vcpu_realloc_fpstate(struct kvm_vcpu *vcpu)
+{
+	unsigned long old_fpspa;
+	size_t fpsize;
+	void *fps;
+
+	fpsize = PAGE_ALIGN(vcpu->arch.guest_fpu.fpstate->size +
+			    ALIGN(offsetof(struct fpstate, regs), 64));
+	fps = alloc_pages_exact(fpsize, GFP_KERNEL_ACCOUNT);
+	if (!fps)
+		return -ENOMEM;
+
+	old_fpspa = pkvm_hypercall(vcpu_add_fpstate, vcpu, __pa(fps), fpsize);
+	if (old_fpspa == __pa(fps)) {
+		free_pages_exact(fps, fpsize);
+	} else if (VALID_PAGE(old_fpspa)) {
+		fps = __va(old_fpspa);
+		fpsize = *(size_t *)fps;
+		free_pages_exact(fps, fpsize);
+	}
+
+	return 0;
+}
+
+static void pkvm_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
+{
+	struct kvm_cpuid_entry2 *e2 = vcpu->arch.cpuid_entries;
+	int nent = vcpu->arch.cpuid_nent;
+	unsigned long unused_pa;
+	void *entries;
+	size_t size;
+
+	/*
+	 * XSAVES is effectively enabled if and only if XSAVE is also exposed
+	 * to the guest.  XSAVES depends on CR4.OSXSAVE, and CR4.OSXSAVE can be
+	 * set if and only if XSAVE is supported.
+	 */
+	if (boot_cpu_has(X86_FEATURE_XSAVE) &&
+	    guest_cpuid_has(vcpu, X86_FEATURE_XSAVE))
+		kvm_governed_feature_check_and_set(vcpu, X86_FEATURE_XSAVES);
+
+	kvm_governed_feature_check_and_set(vcpu, X86_FEATURE_LAM);
+
+	if (vcpu->arch.guest_state_protected || !e2 || !nent)
+		return;
+
+	/*
+	 * With exposing the FPU dynamic feature via the cpuid, the fpstate
+	 * allocated when creating the vcpu may not be sufficient for the
+	 * guest. As the pVM's FPU state is managed by the pkvm hypervisor
+	 * while the npVM's FPU state is managed by the host, re-allocating the
+	 * fpstate is only necessary for the pVM, and should be done before
+	 * adding the new cpuid entries to the pkvm hypervisor.
+	 */
+	if ((vcpu->arch.guest_fpu.xfeatures & XFEATURE_MASK_USER_DYNAMIC) &&
+	    pkvm_is_protected_vcpu(vcpu) &&
+	    pkvm_vcpu_realloc_fpstate(vcpu))
+		return;
+
+	size = sizeof(struct kvm_cpuid_entry2) * nent;
+	entries = alloc_pages_exact(size, GFP_KERNEL_ACCOUNT);
+	if (!entries) {
+		kvm_err("Failed to allocate cpuid pages for pkvm vcpu\n");
+		return;
+	}
+
+	memcpy(entries, (void *)e2, size);
+
+	unused_pa = pkvm_hypercall(vcpu_after_set_cpuid, vcpu,
+				  __pa(entries), nent);
+	if (unused_pa == __pa(entries)) {
+		kvm_err("Failed to set cpuid pages for pkvm vcpu\n");
+		free_pages_exact(entries, size);
+	} else if (VALID_PAGE(unused_pa)) {
+		entries = __va(unused_pa);
+		size = *(size_t *)entries;
+		free_pages_exact(entries, size);
+	}
+}
+
+static u64 pkvm_get_l2_tsc_offset(struct kvm_vcpu *vcpu)
+{
+	return 0;
+}
+
+static u64 pkvm_get_l2_tsc_multiplier(struct kvm_vcpu *vcpu)
+{
+	return kvm_caps.default_tsc_scaling_ratio;
+}
+
+static void pkvm_write_tsc_offset(struct kvm_vcpu *vcpu)
+{
+	/*
+	 * TODO: Not to write tsc_offset if the PV interface can be secure
+	 * enforced.
+	 */
+	pkvm_hypercall(write_tsc_offset, vcpu, vcpu->arch.tsc_offset);
+}
+
+static void pkvm_write_tsc_multiplier(struct kvm_vcpu *vcpu)
+{
+	/*
+	 * TODO: Not to write tsc_multiplier if the PV interface can be secure
+	 * enforced.
+	 */
+	pkvm_hypercall(write_tsc_multiplier, vcpu, vcpu->arch.tsc_scaling_ratio);
+}
+
+static void pkvm_load_mmu_pgd(struct kvm_vcpu *vcpu, hpa_t root_hpa, int root_level)
+{
+	pkvm_hypercall(load_mmu_pgd, vcpu, root_hpa, root_level);
+}
+
+static int pkvm_check_intercept(struct kvm_vcpu *vcpu,
+				struct x86_instruction_info *info,
+				enum x86_intercept_stage stage,
+				struct x86_exception *exception)
+{
+	return X86EMUL_UNHANDLEABLE;
+}
+
+static void pkvm_setup_mce(struct kvm_vcpu *vcpu)
+{
+	pkvm_hypercall(setup_mce, vcpu, vcpu->arch.mcg_cap);
+}
+
+#ifdef CONFIG_KVM_SMM
+static int pkvm_smi_allowed(struct kvm_vcpu *vcpu, bool for_injection)
+{
+	return false;
+}
+
+static int pkvm_enter_smm(struct kvm_vcpu *vcpu, union kvm_smram *smram)
+{
+	return -EINVAL;
+}
+
+static int pkvm_leave_smm(struct kvm_vcpu *vcpu, const union kvm_smram *smram)
+{
+	return -EINVAL;
+}
+
+static void pkvm_enable_smi_window(struct kvm_vcpu *vcpu) {}
+#endif
+
+static bool pkvm_apic_init_signal_blocked(struct kvm_vcpu *vcpu)
+{
+	return false;
+}
+
+static void pkvm_migrate_timers(struct kvm_vcpu *vcpu) {}
+
+static int pkvm_check_emulate_instruction(struct kvm_vcpu *vcpu, int emul_type,
+					  void *insn, int insn_len)
+{
+	/*
+	 * This can only be triggered when the host is emulating a MMIO
+	 * instruction. For the pVM, this shouldn't happen if the pVM is
+	 * enlighted to use hypercall to access MMIO. Or the pVM still expects
+	 * receiving #VE, then returns X86EMUL_RETRY_INSTR to let the pVM to retry
+	 * after clearing the suppress #VE bit in the shadow EPT.
+	 */
+	if (pkvm_is_protected_vcpu(vcpu))
+		return X86EMUL_RETRY_INSTR;
+
+	/* For npVM, the instruction can be emulated */
+	return X86EMUL_CONTINUE;
+}
+
+static void pkvm_msr_filter_changed(struct kvm_vcpu *vcpu) {}
+
+static int pkvm_complete_emulated_msr(struct kvm_vcpu *vcpu, int err)
+{
+	if (err)
+		return pkvm_hypercall(complete_emulated_msr, vcpu, err);
+
+	return pkvm_is_protected_vcpu(vcpu) ? 1 : kvm_skip_emulated_instruction(vcpu);
+}
+
+static void pkvm_update_cpuid_runtime(struct kvm_vcpu *vcpu)
+{
+	pkvm_hypercall(update_cpuid_runtime, vcpu);
+}
+
+#define VMX_REQUIRED_APICV_INHIBITS				\
+	(BIT(APICV_INHIBIT_REASON_DISABLED) |			\
+	 BIT(APICV_INHIBIT_REASON_ABSENT) |			\
+	 BIT(APICV_INHIBIT_REASON_HYPERV) |			\
+	 BIT(APICV_INHIBIT_REASON_BLOCKIRQ) |			\
+	 BIT(APICV_INHIBIT_REASON_PHYSICAL_ID_ALIASED) |	\
+	 BIT(APICV_INHIBIT_REASON_APIC_ID_MODIFIED) |		\
+	 BIT(APICV_INHIBIT_REASON_APIC_BASE_MODIFIED))
+
+static void pkvm_leave_nested(struct kvm_vcpu *vcpu) {}
+static bool pkvm_nested_is_exception_vmexit(struct kvm_vcpu *vcpu, u8 vector,
+					    u32 error_code)
+{
+	return false;
+}
+static int pkvm_check_nested_events(struct kvm_vcpu *vcpu) { return 0; }
+static void pkvm_nested_triple_fault(struct kvm_vcpu *vcpu) {}
+static bool pkvm_get_nested_state_pages(struct kvm_vcpu *vcpu) { return true; }
+static int pkvm_nested_write_pml_buffer(struct kvm_vcpu *vcpu, gpa_t gpa) { return 0; }
+
+static struct kvm_x86_nested_ops pkvm_nested_ops = {
+	.leave_nested = pkvm_leave_nested,
+	.is_exception_vmexit = pkvm_nested_is_exception_vmexit,
+	.check_events = pkvm_check_nested_events,
+	.triple_fault = pkvm_nested_triple_fault,
+	.get_nested_state_pages = pkvm_get_nested_state_pages,
+	.write_log_dirty = pkvm_nested_write_pml_buffer,
+};
+
+struct kvm_x86_ops pkvm_host_x86_ops __initdata = {
+	.name = KBUILD_MODNAME,
+
+	.check_processor_compatibility = pkvm_check_processor_compat,
+
+	.hardware_unsetup = vmx_hardware_unsetup,
+
+	.enable_virtualization_cpu = pkvm_enable_virtualization_cpu,
+	.disable_virtualization_cpu = pkvm_disable_virtualization_cpu,
+	.emergency_disable_virtualization_cpu = pkvm_emergency_disable_virtualization_cpu,
+
+	.has_emulated_msr = pkvm_has_emulated_msr,
+
+	.vm_size = sizeof(struct kvm_vmx),
+	.vm_init = pkvm_vm_init,
+	.vm_destroy = pkvm_vm_destroy,
+
+	.vcpu_precreate = vmx_vcpu_precreate,
+	.vcpu_create = pkvm_vcpu_create,
+	.vcpu_free = pkvm_vcpu_free,
+	.vcpu_reset = pkvm_vcpu_reset,
+
+	.prepare_switch_to_guest = pkvm_prepare_switch_to_guest,
+	.vcpu_load = pkvm_vcpu_load,
+	.vcpu_put = pkvm_vcpu_put,
+
+	.update_exception_bitmap = pkvm_update_exception_bitmap,
+	.get_feature_msr = pkvm_get_feature_msr,
+	.get_msr = pkvm_get_msr,
+	.set_msr = pkvm_set_msr,
+	.get_segment_base = pkvm_get_segment_base,
+	.get_segment = pkvm_get_segment,
+	.set_segment = pkvm_set_segment,
+	.get_cpl = pkvm_get_cpl,
+	.get_cs_db_l_bits = pkvm_get_cs_db_l_bits,
+	.is_valid_cr0 = pkvm_is_valid_cr0,
+	.set_cr0 = pkvm_set_cr0,
+	.post_set_cr3 = pkvm_post_set_cr3,
+	.is_valid_cr4 = pkvm_is_valid_cr4,
+	.set_cr4 = pkvm_set_cr4,
+	.set_efer = pkvm_set_efer,
+	.get_idt = pkvm_get_idt,
+	.set_idt = pkvm_set_idt,
+	.get_gdt = pkvm_get_gdt,
+	.set_gdt = pkvm_set_gdt,
+	.set_dr7 = pkvm_set_dr7,
+	.sync_dirty_debug_regs = pkvm_sync_dirty_debug_regs,
+	.cache_reg = pkvm_cache_reg,
+	.get_rflags = pkvm_get_rflags,
+	.set_rflags = pkvm_set_rflags,
+	.get_if_flag = pkvm_get_if_flag,
+
+	.flush_tlb_all = pkvm_flush_tlb_all,
+	.flush_tlb_current = pkvm_flush_tlb_current,
+	.flush_tlb_gva = pkvm_flush_tlb_gva,
+	.flush_tlb_guest = pkvm_flush_tlb_guest,
+
+	.vcpu_pre_run = pkvm_vcpu_pre_run,
+	.vcpu_run = pkvm_vcpu_run,
+	.handle_exit = pkvm_handle_exit,
+	.skip_emulated_instruction = pkvm_skip_emulated_instruction,
+	.update_emulated_instruction = pkvm_update_emulated_instruction,
+	.set_interrupt_shadow = pkvm_set_interrupt_shadow,
+	.get_interrupt_shadow = pkvm_get_interrupt_shadow,
+	.patch_hypercall = vmx_patch_hypercall,
+	.inject_irq = pkvm_inject_irq,
+	.inject_nmi = pkvm_inject_nmi,
+	.inject_exception = pkvm_inject_exception,
+	.cancel_injection = pkvm_cancel_injection,
+	.interrupt_allowed = pkvm_interrupt_allowed,
+	.nmi_allowed = pkvm_nmi_allowed,
+	.get_nmi_mask = pkvm_get_nmi_mask,
+	.set_nmi_mask = pkvm_set_nmi_mask,
+	.enable_nmi_window = pkvm_enable_nmi_window,
+	.enable_irq_window = pkvm_enable_irq_window,
+	.update_cr8_intercept = pkvm_update_cr8_intercept,
+
+	.x2apic_icr_is_split = false,
+	.set_virtual_apic_mode = pkvm_set_virtual_apic_mode,
+	.set_apic_access_page_addr = pkvm_set_apic_access_page_addr,
+	.refresh_apicv_exec_ctrl = pkvm_refresh_apicv_exec_ctrl,
+	.load_eoi_exitmap = pkvm_load_eoi_exitmap,
+	.apicv_pre_state_restore = vmx_apicv_pre_state_restore,
+	.required_apicv_inhibits = VMX_REQUIRED_APICV_INHIBITS,
+	.hwapic_irr_update = pkvm_hwapic_irr_update,
+	.hwapic_isr_update = pkvm_hwapic_isr_update,
+	.sync_pir_to_irr = pkvm_sync_pir_to_irr,
+	.deliver_interrupt = vmx_deliver_interrupt,
+	.dy_apicv_has_pending_interrupt = pi_has_pending_interrupt,
+
+	.set_tss_addr = vmx_set_tss_addr,
+	.set_identity_map_addr = vmx_set_identity_map_addr,
+	.get_mt_mask = vmx_get_mt_mask,
+
+	.get_exit_info = pkvm_get_exit_info,
+
+	.vcpu_after_set_cpuid = pkvm_vcpu_after_set_cpuid,
+
+	.has_wbinvd_exit = pkvm_has_vmx_wbinvd_exit,
+
+	.get_l2_tsc_offset = pkvm_get_l2_tsc_offset,
+	.get_l2_tsc_multiplier = pkvm_get_l2_tsc_multiplier,
+	.write_tsc_offset = pkvm_write_tsc_offset,
+	.write_tsc_multiplier = pkvm_write_tsc_multiplier,
+
+	.load_mmu_pgd = pkvm_load_mmu_pgd,
+
+	.check_intercept = pkvm_check_intercept,
+	.handle_exit_irqoff = vmx_handle_exit_irqoff,
+
+	.cpu_dirty_log_size = PML_ENTITY_NUM,
+	.update_cpu_dirty_logging = vmx_update_cpu_dirty_logging,
+
+	.nested_ops = &pkvm_nested_ops,
+
+	.pi_update_irte = vmx_pi_update_irte,
+	.pi_start_assignment = vmx_pi_start_assignment,
+
+#ifdef CONFIG_X86_64
+	.set_hv_timer = vmx_set_hv_timer,
+	.cancel_hv_timer = vmx_cancel_hv_timer,
+#endif
+
+	.setup_mce = pkvm_setup_mce,
+
+#ifdef CONFIG_KVM_SMM
+	.smi_allowed = pkvm_smi_allowed,
+	.enter_smm = pkvm_enter_smm,
+	.leave_smm = pkvm_leave_smm,
+	.enable_smi_window = pkvm_enable_smi_window,
+#endif
+
+	.check_emulate_instruction = pkvm_check_emulate_instruction,
+	.apic_init_signal_blocked = pkvm_apic_init_signal_blocked,
+	.migrate_timers = pkvm_migrate_timers,
+
+	.msr_filter_changed = pkvm_msr_filter_changed,
+	.complete_emulated_msr = pkvm_complete_emulated_msr,
+
+	.vcpu_deliver_sipi_vector = kvm_vcpu_deliver_sipi_vector,
+
+	.get_untagged_addr = vmx_get_untagged_addr,
+
+	.update_cpuid_runtime = pkvm_update_cpuid_runtime,
+};
+
+static struct kvm_pmc *pkvm_intel_rdpmc_ecx_to_pmc(struct kvm_vcpu *vcpu,
+						   unsigned int idx, u64 *mask)
+{
+	return NULL;
+}
+static struct kvm_pmc *pkvm_intel_msr_idx_to_pmc(struct kvm_vcpu *vcpu, u32 msr) { return NULL; }
+static bool pkvm_intel_is_valid_msr(struct kvm_vcpu *vcpu, u32 msr) { return false; }
+static int pkvm_intel_pmu_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info) { return 1; }
+static int pkvm_intel_pmu_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info) { return 1; }
+static void pkvm_intel_pmu_refresh(struct kvm_vcpu *vcpu) {}
+static void pkvm_intel_pmu_init(struct kvm_vcpu *vcpu) {}
+static void pkvm_intel_pmu_reset(struct kvm_vcpu *vcpu) {}
+static void pkvm_intel_pmu_deliver_pmi(struct kvm_vcpu *vcpu) {}
+static void pkvm_intel_pmu_cleanup(struct kvm_vcpu *vcpu) {}
+
+static struct kvm_pmu_ops pkvm_intel_pmu_ops __initdata = {
+	.rdpmc_ecx_to_pmc = pkvm_intel_rdpmc_ecx_to_pmc,
+	.msr_idx_to_pmc = pkvm_intel_msr_idx_to_pmc,
+	.is_valid_msr = pkvm_intel_is_valid_msr,
+	.get_msr = pkvm_intel_pmu_get_msr,
+	.set_msr = pkvm_intel_pmu_set_msr,
+	.refresh = pkvm_intel_pmu_refresh,
+	.init = pkvm_intel_pmu_init,
+	.reset = pkvm_intel_pmu_reset,
+	.deliver_pmi = pkvm_intel_pmu_deliver_pmi,
+	.cleanup = pkvm_intel_pmu_cleanup,
+	.EVENTSEL_EVENT = ARCH_PERFMON_EVENTSEL_EVENT,
+	.MAX_NR_GP_COUNTERS = 0,
+	.MIN_NR_GP_COUNTERS = 0,
+};
+
+struct kvm_x86_init_ops pkvm_host_init_ops __initdata = {
+	.hardware_setup = vmx_hardware_setup,
+	.handle_intel_pt_intr = NULL,
+
+	.runtime_ops = &pkvm_host_x86_ops,
+	.pmu_ops = &pkvm_intel_pmu_ops,
+};
+
+
+/* ========================= pkvm_fuzz syscall & proxy ========================= */
+
+struct pkvm_fuzz_exit_info {
+	u32 reason;
+	u32 pad0;
+	u64 info1;
+	u64 info2;
+	u32 intr_info;
+	u32 error_code;
+};
+
+static struct kvm *pkvm_fuzz_get_kvm(unsigned long fd, struct file **out)
+{
+	struct file *file;
+	struct kvm *kvm;
+
+	file = fget((int)fd);
+	if (!file)
+		return ERR_PTR(-EBADF);
+
+	if (!file_is_kvm(file)) {
+		fput(file);
+		return ERR_PTR(-EINVAL);
+	}
+
+	kvm = file->private_data;
+	if (!kvm) {
+		fput(file);
+		return ERR_PTR(-EINVAL);
+	}
+
+	*out = file;
+	return kvm;
+}
+
+static struct kvm_vcpu *pkvm_fuzz_get_vcpu(unsigned long fd, struct file **out)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	file = fget((int)fd);
+	if (!file)
+		return ERR_PTR(-EBADF);
+
+    if (!file_is_kvm_vcpu(file)) {
+		fput(file);
+		return ERR_PTR(-EINVAL);
+	}
+
+	vcpu = file->private_data;
+	if (!vcpu) {
+		fput(file);
+		return ERR_PTR(-EINVAL);
+	}
+
+	*out = file;
+	return vcpu;
+}
+
+static long pkvm_fuzz_has_emulated_msr(unsigned long vmfd, unsigned long index)
+{
+	struct file *file;
+	struct kvm *kvm;
+	long ret;
+
+	kvm = pkvm_fuzz_get_kvm(vmfd, &file);
+	if (IS_ERR(kvm))
+		return PTR_ERR(kvm);
+
+	ret = pkvm_has_emulated_msr(kvm, (u32)index);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_vm_init(unsigned long vmfd)
+{
+	struct file *file;
+	struct kvm *kvm;
+	long ret;
+
+	kvm = pkvm_fuzz_get_kvm(vmfd, &file);
+	if (IS_ERR(kvm))
+		return PTR_ERR(kvm);
+
+	ret = pkvm_vm_init(kvm);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_vm_destroy(unsigned long vmfd)
+{
+	struct file *file;
+	struct kvm *kvm;
+
+	kvm = pkvm_fuzz_get_kvm(vmfd, &file);
+	if (IS_ERR(kvm))
+		return PTR_ERR(kvm);
+
+	pkvm_vm_destroy(kvm);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_vcpu_create(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_vcpu_create(vcpu);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_vcpu_free(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_vcpu_free(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_vcpu_reset(unsigned long vcpufd, unsigned long init_event)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_vcpu_reset(vcpu, !!init_event);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_prepare_switch_to_guest(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_prepare_switch_to_guest(vcpu);
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_vcpu_load(unsigned long vcpufd, unsigned long cpu)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_vcpu_load(vcpu, (int)cpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_vcpu_put(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_vcpu_put(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_update_exception_bitmap(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_update_exception_bitmap(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_get_feature_msr(unsigned long msr, unsigned long user_ptr)
+{
+	u64 data;
+	long ret;
+
+	ret = pkvm_get_feature_msr((u32)msr, &data);
+	if (!ret) {
+		if (copy_to_user((void __user *)user_ptr, &data, sizeof(data)))
+			return -EFAULT;
+	}
+
+	return ret;
+}
+
+static long pkvm_fuzz_get_msr(unsigned long vcpufd, unsigned long user_ptr)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	struct msr_data msr_info;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	if (copy_from_user(&msr_info, (void __user *)user_ptr, sizeof(msr_info))) {
+		fput(file);
+		return -EFAULT;
+	}
+
+	ret = pkvm_get_msr(vcpu, &msr_info);
+	if (!ret) {
+		if (copy_to_user((void __user *)user_ptr, &msr_info, sizeof(msr_info))) {
+			fput(file);
+			return -EFAULT;
+		}
+	}
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_set_msr(unsigned long vcpufd, unsigned long user_ptr)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	struct msr_data msr_info;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	if (copy_from_user(&msr_info, (void __user *)user_ptr, sizeof(msr_info))) {
+		fput(file);
+		return -EFAULT;
+	}
+
+	ret = pkvm_set_msr(vcpu, &msr_info);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_get_segment_base(unsigned long vcpufd, unsigned long seg)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	u64 base;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	base = pkvm_get_segment_base(vcpu, (int)seg);
+
+	fput(file);
+	return (long)base;
+}
+
+static long pkvm_fuzz_get_segment(unsigned long vcpufd, unsigned long user_ptr, unsigned long seg)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	struct kvm_segment kseg;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	memset(&kseg, 0, sizeof(kseg));
+	pkvm_get_segment(vcpu, &kseg, (int)seg);
+
+	if (copy_to_user((void __user *)user_ptr, &kseg, sizeof(kseg))) {
+		fput(file);
+		return -EFAULT;
+	}
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_set_segment(unsigned long vcpufd, unsigned long user_ptr, unsigned long seg)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	struct kvm_segment kseg;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	if (copy_from_user(&kseg, (void __user *)user_ptr, sizeof(kseg))) {
+		fput(file);
+		return -EFAULT;
+	}
+
+	pkvm_set_segment(vcpu, &kseg, (int)seg);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_get_cpl(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_get_cpl(vcpu);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_get_cs_db_l_bits(unsigned long vcpufd, unsigned long db_ptr, unsigned long l_ptr)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	int db, l;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_get_cs_db_l_bits(vcpu, &db, &l);
+	fput(file);
+
+	if (copy_to_user((void __user *)db_ptr, &db, sizeof(db)))
+		return -EFAULT;
+	if (copy_to_user((void __user *)l_ptr, &l, sizeof(l)))
+		return -EFAULT;
+	return 0;
+}
+
+static long pkvm_fuzz_is_valid_cr0(unsigned long vcpufd, unsigned long cr0)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_is_valid_cr0(vcpu, cr0);
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_set_cr0(unsigned long vcpufd, unsigned long cr0)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_set_cr0(vcpu, cr0);
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_post_set_cr3(unsigned long vcpufd, unsigned long cr3)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_post_set_cr3(vcpu, cr3);
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_is_valid_cr4(unsigned long vcpufd, unsigned long cr4)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_is_valid_cr4(vcpu, cr4);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_set_cr4(unsigned long vcpufd, unsigned long cr4)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_set_cr4(vcpu, cr4);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_set_efer(unsigned long vcpufd, unsigned long efer)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_set_efer(vcpu, (u64)efer);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_get_idt(unsigned long vcpufd, unsigned long user_ptr)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	struct desc_ptr dt;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+	memset(&dt, 0, sizeof(dt));
+
+	pkvm_get_idt(vcpu, &dt);
+
+	fput(file);
+	if (copy_to_user((void __user *)user_ptr, &dt, sizeof(dt)))
+		return -EFAULT;
+	return 0;
+}
+
+static long pkvm_fuzz_set_idt(unsigned long vcpufd, unsigned long user_ptr)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	struct desc_ptr dt;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	if (copy_from_user(&dt, (void __user *)user_ptr, sizeof(dt))) {
+		fput(file);
+		return -EFAULT;
+	}
+
+	pkvm_set_idt(vcpu, &dt);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_get_gdt(unsigned long vcpufd, unsigned long user_ptr)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	struct desc_ptr dt;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+	memset(&dt, 0, sizeof(dt));
+
+	pkvm_get_gdt(vcpu, &dt);
+
+	fput(file);
+	if (copy_to_user((void __user *)user_ptr, &dt, sizeof(dt)))
+		return -EFAULT;
+	return 0;
+}
+
+static long pkvm_fuzz_set_gdt(unsigned long vcpufd, unsigned long user_ptr)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	struct desc_ptr dt;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	if (copy_from_user(&dt, (void __user *)user_ptr, sizeof(dt))) {
+		fput(file);
+		return -EFAULT;
+	}
+
+	pkvm_set_gdt(vcpu, &dt);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_set_dr7(unsigned long vcpufd, unsigned long dr7)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_set_dr7(vcpu, dr7);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_sync_dirty_debug_regs(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_sync_dirty_debug_regs(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_cache_reg(unsigned long vcpufd, unsigned long reg)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_cache_reg(vcpu, (enum kvm_reg)reg);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_get_rflags(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	unsigned long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_get_rflags(vcpu);
+
+	fput(file);
+	return (long)ret;
+}
+
+static long pkvm_fuzz_set_rflags(unsigned long vcpufd, unsigned long rflags)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_set_rflags(vcpu, rflags);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_get_if_flag(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_get_if_flag(vcpu);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_flush_tlb_all(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_flush_tlb_all(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_flush_tlb_current(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_flush_tlb_current(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_flush_tlb_gva(unsigned long vcpufd, unsigned long gva)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_flush_tlb_gva(vcpu, (gva_t)gva);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_flush_tlb_guest(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_flush_tlb_guest(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_vcpu_pre_run(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_vcpu_pre_run(vcpu);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_vcpu_run(unsigned long vcpufd, unsigned long run_flags)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_vcpu_run(vcpu, run_flags);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_handle_exit(unsigned long vcpufd, unsigned long exit_fastpath)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_handle_exit(vcpu, (fastpath_t)exit_fastpath);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_skip_emulated_instruction(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_skip_emulated_instruction(vcpu);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_update_emulated_instruction(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_update_emulated_instruction(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_set_interrupt_shadow(unsigned long vcpufd, unsigned long mask)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_set_interrupt_shadow(vcpu, (int)mask);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_get_interrupt_shadow(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	u32 ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_get_interrupt_shadow(vcpu);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_inject_irq(unsigned long vcpufd, unsigned long reinjected)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_inject_irq(vcpu, !!reinjected);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_inject_nmi(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_inject_nmi(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_inject_exception(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_inject_exception(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_cancel_injection(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_cancel_injection(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_interrupt_allowed(unsigned long vcpufd, unsigned long for_injection)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_interrupt_allowed(vcpu, !!for_injection);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_nmi_allowed(unsigned long vcpufd, unsigned long for_injection)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_nmi_allowed(vcpu, !!for_injection);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_get_nmi_mask(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	bool ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_get_nmi_mask(vcpu);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_set_nmi_mask(unsigned long vcpufd, unsigned long masked)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_set_nmi_mask(vcpu, !!masked);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_enable_nmi_window(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_enable_nmi_window(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_enable_irq_window(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_enable_irq_window(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_update_cr8_intercept(unsigned long vcpufd, unsigned long tpr, unsigned long irr)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_update_cr8_intercept(vcpu, (int)tpr, (int)irr);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_set_virtual_apic_mode(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_set_virtual_apic_mode(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_set_apic_access_page_addr(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_set_apic_access_page_addr(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_refresh_apicv_exec_ctrl(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_refresh_apicv_exec_ctrl(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_load_eoi_exitmap(unsigned long vcpufd, unsigned long user_ptr)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	u64 exitmap[4];
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	if (copy_from_user(exitmap, (void __user *)user_ptr, sizeof(exitmap))) {
+		fput(file);
+		return -EFAULT;
+	}
+
+	pkvm_load_eoi_exitmap(vcpu, exitmap);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_hwapic_irr_update(unsigned long vcpufd, unsigned long max_irr)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_hwapic_irr_update(vcpu, (int)max_irr);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_hwapic_isr_update(unsigned long vcpufd, unsigned long max_isr)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_hwapic_isr_update(vcpu, (int)max_isr);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_sync_pir_to_irr(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_sync_pir_to_irr(vcpu);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_get_exit_info(unsigned long vcpufd, unsigned long user_ptr)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	struct pkvm_fuzz_exit_info out;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_get_exit_info(vcpu, &out.reason, &out.info1, &out.info2,
+			   &out.intr_info, &out.error_code);
+	fput(file);
+
+	if (copy_to_user((void __user *)user_ptr, &out, sizeof(out)))
+		return -EFAULT;
+	return 0;
+}
+
+static long pkvm_fuzz_vcpu_after_set_cpuid(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_vcpu_after_set_cpuid(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_get_l2_tsc_offset(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	u64 ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_get_l2_tsc_offset(vcpu);
+
+	fput(file);
+	return (long)ret;
+}
+
+static long pkvm_fuzz_get_l2_tsc_multiplier(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	u64 ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_get_l2_tsc_multiplier(vcpu);
+
+	fput(file);
+	return (long)ret;
+}
+
+static long pkvm_fuzz_write_tsc_offset(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_write_tsc_offset(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_write_tsc_multiplier(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_write_tsc_multiplier(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_load_mmu_pgd(unsigned long vcpufd, unsigned long root_hpa, unsigned long root_level)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_load_mmu_pgd(vcpu, (hpa_t)root_hpa, (int)root_level);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_setup_mce(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_setup_mce(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_apic_init_signal_blocked(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_apic_init_signal_blocked(vcpu);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_migrate_timers(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_migrate_timers(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_msr_filter_changed(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_msr_filter_changed(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+static long pkvm_fuzz_complete_emulated_msr(unsigned long vcpufd, int err)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+	long ret;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	ret = pkvm_complete_emulated_msr(vcpu, err);
+
+	fput(file);
+	return ret;
+}
+
+static long pkvm_fuzz_update_cpuid_runtime(unsigned long vcpufd)
+{
+	struct file *file;
+	struct kvm_vcpu *vcpu;
+
+	vcpu = pkvm_fuzz_get_vcpu(vcpufd, &file);
+	if (IS_ERR(vcpu))
+		return PTR_ERR(vcpu);
+
+	pkvm_update_cpuid_runtime(vcpu);
+
+	fput(file);
+	return 0;
+}
+
+SYSCALL_DEFINE6(pkvm_fuzz, unsigned long, fn, unsigned long, a0,
+	                       unsigned long, a1, unsigned long, a2,
+	                       unsigned long, a3, unsigned long, a4)
+{
+	switch (fn) {
+	case 0: return pkvm_check_processor_compat();
+	case 1: return pkvm_enable_virtualization_cpu();
+	case 2: pkvm_disable_virtualization_cpu(); return 0;
+	case 3: pkvm_emergency_disable_virtualization_cpu(); return 0; // TODO: undefined in pKVM
+	case 4: return pkvm_fuzz_has_emulated_msr(a0, a1);
+	case 5: return pkvm_fuzz_vm_init(a0);
+	case 6: return pkvm_fuzz_vm_destroy(a0);
+
+	case 7: return pkvm_fuzz_vcpu_create(a0);
+	case 8: return pkvm_fuzz_vcpu_free(a0);
+	case 9: return pkvm_fuzz_vcpu_reset(a0, a1);
+
+	case 10: return pkvm_fuzz_prepare_switch_to_guest(a0);
+	case 11: return pkvm_fuzz_vcpu_load(a0, a1);
+	case 12: return pkvm_fuzz_vcpu_put(a0);
+
+	case 13: return pkvm_fuzz_update_exception_bitmap(a0);
+	case 14: return pkvm_fuzz_get_feature_msr(a0, a1); // TODO: No pkvm_hypercall
+	case 15: return pkvm_fuzz_get_msr(a0, a1);
+	case 16: return pkvm_fuzz_set_msr(a0, a1);
+	case 17: return pkvm_fuzz_get_segment_base(a0, a1);
+	case 18: return pkvm_fuzz_get_segment(a0, a1, a2);
+	case 19: return pkvm_fuzz_set_segment(a0, a1, a2);
+	case 20: return pkvm_fuzz_get_cpl(a0);
+	case 21: return pkvm_fuzz_get_cs_db_l_bits(a0, a1, a2);
+	case 22: return pkvm_fuzz_is_valid_cr0(a0, a1);
+	case 23: return pkvm_fuzz_set_cr0(a0, a1);
+	case 24: return pkvm_fuzz_post_set_cr3(a0, a1);
+	case 25: return pkvm_fuzz_is_valid_cr4(a0, a1);
+	case 26: return pkvm_fuzz_set_cr4(a0, a1);
+	case 27: return pkvm_fuzz_set_efer(a0, a1);
+	case 28: return pkvm_fuzz_get_idt(a0, a1);
+	case 29: return pkvm_fuzz_set_idt(a0, a1);
+	case 30: return pkvm_fuzz_get_gdt(a0, a1);
+	case 31: return pkvm_fuzz_set_gdt(a0, a1);
+	case 32: return pkvm_fuzz_set_dr7(a0, a1);
+	case 33: return pkvm_fuzz_sync_dirty_debug_regs(a0);
+	case 34: return pkvm_fuzz_cache_reg(a0, a1);
+	case 35: return pkvm_fuzz_get_rflags(a0);
+	case 36: return pkvm_fuzz_set_rflags(a0, a1);
+	case 37: return pkvm_fuzz_get_if_flag(a0);
+
+	case 38: return pkvm_fuzz_flush_tlb_all(a0);
+	case 39: return pkvm_fuzz_flush_tlb_current(a0);
+	case 40: return pkvm_fuzz_flush_tlb_gva(a0, a1);
+	case 41: return pkvm_fuzz_flush_tlb_guest(a0);
+
+	case 42: return pkvm_fuzz_vcpu_pre_run(a0);
+	case 43: return pkvm_fuzz_vcpu_run(a0, a1);
+	case 44: return pkvm_fuzz_handle_exit(a0, a1);
+	case 45: return pkvm_fuzz_skip_emulated_instruction(a0);
+	case 46: return pkvm_fuzz_update_emulated_instruction(a0);
+	case 47: return pkvm_fuzz_set_interrupt_shadow(a0, a1);
+	case 48: return pkvm_fuzz_get_interrupt_shadow(a0);
+	case 49: return pkvm_fuzz_inject_irq(a0, a1);
+	case 50: return pkvm_fuzz_inject_nmi(a0);
+	case 51: return pkvm_fuzz_inject_exception(a0);
+	case 52: return pkvm_fuzz_cancel_injection(a0);
+	case 53: return pkvm_fuzz_interrupt_allowed(a0, a1);
+	case 54: return pkvm_fuzz_nmi_allowed(a0, a1);
+	case 55: return pkvm_fuzz_get_nmi_mask(a0);
+	case 56: return pkvm_fuzz_set_nmi_mask(a0, a1);
+	case 57: return pkvm_fuzz_enable_nmi_window(a0);
+	case 58: return pkvm_fuzz_enable_irq_window(a0);
+	case 59: return pkvm_fuzz_update_cr8_intercept(a0, a1, a2);
+
+	case 60: return pkvm_fuzz_set_virtual_apic_mode(a0);
+	case 61: return pkvm_fuzz_set_apic_access_page_addr(a0);
+	case 62: return pkvm_fuzz_refresh_apicv_exec_ctrl(a0);
+	case 63: return pkvm_fuzz_load_eoi_exitmap(a0, a1);
+	case 64: return pkvm_fuzz_hwapic_irr_update(a0, a1);
+	case 65: return pkvm_fuzz_hwapic_isr_update(a0, a1);
+	case 66: return pkvm_fuzz_sync_pir_to_irr(a0);
+
+	case 67: return pkvm_fuzz_get_exit_info(a0, a1);
+
+	case 68: return pkvm_fuzz_vcpu_after_set_cpuid(a0);
+
+	case 69: return pkvm_has_vmx_wbinvd_exit(); // TODO: undefined in pKVM
+
+	case 70: return pkvm_fuzz_get_l2_tsc_offset(a0);
+	case 71: return pkvm_fuzz_get_l2_tsc_multiplier(a0);
+	case 72: return pkvm_fuzz_write_tsc_offset(a0);
+	case 73: return pkvm_fuzz_write_tsc_multiplier(a0);
+
+	case 74: return pkvm_fuzz_load_mmu_pgd(a0, a1, a2);
+
+	case 75: return -EOPNOTSUPP; // TODO: need to design helper function and Syzlang description
+
+	case 76: return pkvm_fuzz_setup_mce(a0);
+
+	case 77: return -EOPNOTSUPP; // TODO: need to design helper function and Syzlang description
+	case 78: return pkvm_fuzz_apic_init_signal_blocked(a0);
+	case 79: return pkvm_fuzz_migrate_timers(a0);
+
+	case 80: return pkvm_fuzz_msr_filter_changed(a0);
+	case 81: return pkvm_fuzz_complete_emulated_msr(a0, a1);
+
+	case 82: return pkvm_fuzz_update_cpuid_runtime(a0);
+
+	default: return -EINVAL;
+	}
+}
