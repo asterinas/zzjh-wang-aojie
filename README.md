@@ -5,9 +5,8 @@
 ### 1. 下载 go 语言编译器
 
 ```cmd
-wget https://go.dev/dl/go1.24.4.linux-amd64.tar.gz  # 这里选择的是当时最新版的 go
+wget https://go.dev/dl/go1.24.4.linux-amd64.tar.gz
 tar -xf go1.24.4.linux-amd64.tar.gz
-# 向 ~/.bashrc 文件添加以下内容并通过 source ~/.bashrc 命令更新配置
 export GOROOT=`pwd`/go
 export PATH=$GOROOT/bin:$PATH
 ```
